@@ -5,6 +5,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace stormglass {
@@ -31,13 +32,38 @@ struct Pane {
 
 class KeyedWindowState {
 public:
+    // Existing interface (unchanged behavior when allowed_lateness == 0)
     void Add(const std::string& key, const Window& window, int64_t value);
     [[nodiscard]] std::vector<Window> ExpiredWindows(Timestamp watermark) const;
     std::vector<WindowResult> FireWindow(const Window& window);
     [[nodiscard]] std::vector<Window> AllWindows() const;
 
+    // Late-data policy
+    void SetAllowedLateness(Duration lateness);
+
+    // Returns true if the record was accepted (window still within lateness).
+    // Returns false if dropped (too late).
+    bool AddWithLateness(const std::string& key, const Window& window,
+                         int64_t value, Timestamp current_watermark);
+
+    // Windows that should be finally GC'd (watermark > end + allowed_lateness)
+    [[nodiscard]] std::vector<Window> GarbageCollectableWindows(Timestamp watermark) const;
+
+    // Actually remove panes and tracking for GC'd windows
+    void GarbageCollect(const std::vector<Window>& windows);
+
+    // Windows that received late data after initial fire and need re-emission
+    [[nodiscard]] std::vector<Window> RefiredWindows() const;
+    void ClearRefired();
+
+    // Check if a window has already been fired
+    [[nodiscard]] bool IsFired(const Window& window) const;
+
 private:
     std::unordered_map<KeyWindow, Pane, KeyWindowHash> panes_;
+    Duration allowed_lateness_{0};
+    std::unordered_set<Window, WindowHash> fired_windows_;
+    std::unordered_set<Window, WindowHash> refired_windows_;
 };
 
 } // namespace stormglass
