@@ -27,7 +27,7 @@ Source → [Watermark] → Keyed Window Operator → Sink
 
 1. **Snapshot checkpoint, not delta-WAL** — window state is bounded and self-expiring; the source is the replay log
 2. **Degenerate Chandy-Lamport barrier** — single pipeline path makes the barrier trivial; extends to multi-input in v2 without rewrite
-3. **SIMD aggregation kernels** — explicit AVX2/SSE4.2 intrinsics for contiguous int64 spans, 1.55× over scalar
+3. **SIMD aggregation kernels** — explicit AVX2/SSE4.2 intrinsics for contiguous int64 spans, 1.6–2.6× over scalar
 4. **Bounded out-of-orderness watermarks** — wm = max_event_time − disorder bound; in-band as control records
 5. **Single-threaded by design** — eliminates data races; concurrency is v2's problem
 
@@ -35,9 +35,9 @@ Source → [Watermark] → Keyed Window Operator → Sink
 
 | Metric | Value | How measured |
 |--------|-------|--------------|
-| Pipeline throughput | 1.3–1.7 M records/sec | 1M records, tumbling 1s (1000 windows fired), Release -O3, 4-vCPU Xeon |
-| SIMD kernel speedup | 1.9–2.4× | AVX2 sum vs scalar, 1M int64 elements, 100 iterations (shared cloud vCPU) |
-| Checkpoint pause | <1ms | Atomic snapshot of 1000 panes (10 keys × 100 windows) |
+| Pipeline throughput | 1.8–3.1 M records/sec | 1M records, tumbling 1s (1000 windows fired), Release -O3 -march=native. Measured on shared 4-vCPU Xeon 6975P-C; high variance from CPU scheduling noise |
+| SIMD kernel speedup | 1.6–2.6× | AVX2 sum vs scalar over 1M int64 elements (100 iterations). Range reflects shared-infra scheduling variance; dedicated hardware expected at the higher end |
+| Checkpoint pause | 3–6 ms | 1000 panes (10 keys × 100 windows), includes fsync + dir-fsync. Measured overhead vs identical run without checkpointing |
 
 ## Verification
 
