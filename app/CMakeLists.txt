@@ -1,0 +1,6 @@
+add_executable(stormglass_demo stormglass/main.cpp)
+target_link_libraries(stormglass_demo PRIVATE stormglass_lib)
+add_executable(stormglass_bench bench/main.cpp)
+target_link_libraries(stormglass_bench PRIVATE stormglass_lib)
+add_executable(stormglass_oracle oracle/main.cpp)
+target_link_libraries(stormglass_oracle PRIVATE stormglass_lib)
