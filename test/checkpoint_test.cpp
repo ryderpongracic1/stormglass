@@ -270,11 +270,10 @@ TEST_F(CheckpointTest, RestoreIntoState) {
 }
 
 TEST_F(CheckpointTest, RestoreWithLatenessRefiresBehavior) {
-    // Finding 4: Checkpoint doesn't persist fired_windows_/refired_windows_.
-    // After restore with allowed_lateness, previously-fired windows look unfired
-    // and will re-fire on the next watermark advance.
-    // This test documents the behavior: it's acceptable under at-least-once
-    // (duplicates, not data loss), but worth making explicit.
+    // Checkpoint v2 persists fired_windows_, so after restore with
+    // allowed_lateness, previously-fired windows are correctly tracked.
+    // Combined results across crash+restore must contain all oracle results
+    // (at-least-once semantics).
     
     GeneratorConfig gen_config;
     gen_config.seed = 77;
@@ -289,8 +288,10 @@ TEST_F(CheckpointTest, RestoreWithLatenessRefiresBehavior) {
     pipe_config.checkpoint_interval = 5000;
     pipe_config.allowed_lateness = Duration{2000};  // 2s lateness
     
+    // Collect results across all runs (at-least-once: combined must cover oracle)
+    std::map<std::pair<std::string, int64_t>, std::pair<int64_t, uint64_t>> combined;
+    
     // First run: process 10000 records with lateness, then "crash"
-    std::vector<WindowResult> first_run_results;
     {
         auto source = std::make_unique<StoppingSource>(
             std::make_unique<DeterministicGenerator>(gen_config), 10000u);
@@ -299,13 +300,14 @@ TEST_F(CheckpointTest, RestoreWithLatenessRefiresBehavior) {
         Pipeline pipeline(std::move(source), std::make_unique<TumblingAssigner>(Duration{1000}),
                          std::move(sink), pipe_config);
         auto stats = pipeline.Run();
-        first_run_results = sink_ptr->Results();
         EXPECT_GE(stats.checkpoints_written, 1u);
-        // With lateness enabled, windows fire but panes stay alive for late data
+        for (auto& r : sink_ptr->Results()) {
+            auto key = std::make_pair(r.key, r.window.start.time_since_epoch().count());
+            combined[key] = {r.result.value, r.result.count};
+        }
     }
     
     // Second run: restore and run to completion
-    std::vector<WindowResult> second_run_results;
     {
         auto source = std::make_unique<DeterministicGenerator>(gen_config);
         auto sink = std::make_unique<MemorySink>();
@@ -313,8 +315,11 @@ TEST_F(CheckpointTest, RestoreWithLatenessRefiresBehavior) {
         Pipeline pipeline(std::move(source), std::make_unique<TumblingAssigner>(Duration{1000}),
                          std::move(sink), pipe_config);
         auto stats = pipeline.Run();
-        second_run_results = sink_ptr->Results();
         EXPECT_GT(stats.records_replayed, 0u);
+        for (auto& r : sink_ptr->Results()) {
+            auto key = std::make_pair(r.key, r.window.start.time_since_epoch().count());
+            combined[key] = {r.result.value, r.result.count};
+        }
     }
     
     // Oracle: what should the FULL run produce?
@@ -329,27 +334,16 @@ TEST_F(CheckpointTest, RestoreWithLatenessRefiresBehavior) {
     }
     auto oracle_results = oracle.ComputeResults();
     
-    // Key assertion: second run (after restore) must contain all oracle results
-    // (at-least-once). It may have duplicates because fired_windows_ isn't persisted
-    // and some windows will re-fire after restore.
-    std::map<std::pair<std::string, int64_t>, std::pair<int64_t, uint64_t>> engine_map;
-    for (auto& r : second_run_results) {
-        auto key = std::make_pair(r.key, r.window.start.time_since_epoch().count());
-        engine_map[key] = {r.result.value, r.result.count};
-    }
-    
+    // Key assertion: combined results across crash+restore must contain all
+    // oracle results with zero data loss. Fired windows are persisted in v2
+    // checkpoints, preventing spurious re-fire and duplicate-instead-of-loss.
     uint64_t missing = 0;
     for (auto& r : oracle_results) {
         auto key = std::make_pair(r.key, r.window.start.time_since_epoch().count());
-        if (engine_map.find(key) == engine_map.end()) {
+        if (combined.find(key) == combined.end()) {
             missing++;
         }
     }
-    if (missing > 0) {
-        std::cout << "  [KNOWN LIMITATION] Checkpoint+lateness lost " << missing
-                  << "/" << oracle_results.size() << " results" << std::endl;
-    }
-    // The loss should be bounded - not catastrophic
-    EXPECT_LT(missing, oracle_results.size() / 2)
-        << "More than 50% of results lost - exceeds known limitation bounds";
+    EXPECT_EQ(missing, 0u) << "Checkpoint+lateness: restore lost " << missing
+                           << "/" << oracle_results.size() << " results";
 }

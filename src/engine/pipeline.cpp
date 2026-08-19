@@ -35,6 +35,11 @@ void Pipeline::TryRestore() {
         state_.RestorePane(entry.key, entry.window, entry.sum, entry.count);
     }
 
+    // Restore fired windows (v2+ checkpoints)
+    if (!data->fired_windows.empty()) {
+        state_.RestoreFiredWindows(data->fired_windows);
+    }
+
     // Restore watermark
     watermark_.Advance(data->watermark);
 

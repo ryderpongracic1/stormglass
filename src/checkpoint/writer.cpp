@@ -15,7 +15,7 @@ namespace stormglass {
 namespace {
 
 constexpr uint32_t kMagic = 0x4B434753;  // "SGCK" little-endian
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 
 // Header layout (32 bytes):
 //   magic:        4 bytes
@@ -111,7 +111,15 @@ bool CheckpointWriter::WriteCheckpoint(uint64_t offset, Timestamp watermark,
         AppendLE64(payload, pane.count);
     }
 
-    // Compute CRC over header + body
+    // Fired windows section (version 2+)
+    const auto& fired = state.FiredWindows();
+    AppendLE64(payload, fired.size());
+    for (const auto& w : fired) {
+        AppendSLE64(payload, w.start.time_since_epoch().count());
+        AppendSLE64(payload, w.end.time_since_epoch().count());
+    }
+
+    // Compute CRC over header + body + fired windows
     uint32_t crc = Crc32c(payload.data(), payload.size());
 
     // Trailer

@@ -66,7 +66,6 @@ make bench                           # Release throughput numbers
 - At-least-once, not exactly-once (idempotent sink upgrades to effectively-once; not built)
 - Checkpoint pauses the operator (upgrade path: clone-then-serialize-async)
 - No persistent source integration (v2: Postgres CDC via logical decoding)
-- Checkpoint does not persist fired-window bookkeeping — after restore with allowed_lateness, previously-fired windows may re-fire (acceptable under at-least-once, but increases duplicate count)
 - SIMD kernels proven in isolation; pipeline uses scalar per-pane accumulation (vectorized window operator is the v2 optimization)
 
 ## Tech stack

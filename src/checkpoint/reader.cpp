@@ -13,7 +13,7 @@ namespace stormglass {
 namespace {
 
 constexpr uint32_t kMagic = 0x4B434753;  // "SGCK" little-endian
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kMaxVersion = 2;
 constexpr size_t kHeaderSize = 32;
 constexpr size_t kTrailerSize = 12;
 
@@ -120,7 +120,7 @@ std::optional<CheckpointData> CheckpointReader::TryLoad(const std::string& path)
     if (magic != kMagic) return std::nullopt;
 
     uint32_t version = ReadLE32(p + 4);
-    if (version != kVersion) return std::nullopt;
+    if (version == 0 || version > kMaxVersion) return std::nullopt;
 
     uint64_t offset = ReadLE64(p + 8);
     int64_t watermark_ms = ReadSLE64(p + 16);
@@ -159,6 +159,21 @@ std::optional<CheckpointData> CheckpointReader::TryLoad(const std::string& path)
             .sum = pane_sum,
             .count = pane_count,
         });
+    }
+
+    // Version 2+: read fired windows section
+    if (version >= 2) {
+        if (pos + 8 > body_end) return std::nullopt;
+        uint64_t num_fired = ReadLE64(data.data() + pos);
+        pos += 8;
+        result.fired_windows.reserve(num_fired);
+        for (uint64_t i = 0; i < num_fired; ++i) {
+            if (pos + 16 > body_end) return std::nullopt;
+            int64_t start = ReadSLE64(data.data() + pos); pos += 8;
+            int64_t end = ReadSLE64(data.data() + pos); pos += 8;
+            result.fired_windows.push_back(Window{
+                Timestamp{Duration{start}}, Timestamp{Duration{end}}});
+        }
     }
 
     if (pos != body_end) return std::nullopt;  // Trailing garbage

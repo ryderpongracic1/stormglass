@@ -64,8 +64,20 @@ public:
         return panes_;
     }
 
+    // For checkpoint serialization: read-only access to fired windows
+    [[nodiscard]] const std::unordered_set<Window, WindowHash>& FiredWindows() const {
+        return fired_windows_;
+    }
+
     // For checkpoint restoration: insert a pane directly
     void RestorePane(const std::string& key, const Window& window, int64_t sum, uint64_t count);
+
+    // For checkpoint restoration: restore fired windows from checkpoint
+    void RestoreFiredWindows(const std::vector<Window>& windows) {
+        for (const auto& w : windows) {
+            fired_windows_.insert(w);
+        }
+    }
 
 private:
     std::unordered_map<KeyWindow, Pane, KeyWindowHash> panes_;
