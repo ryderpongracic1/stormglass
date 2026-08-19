@@ -59,6 +59,14 @@ public:
     // Check if a window has already been fired
     [[nodiscard]] bool IsFired(const Window& window) const;
 
+    // For checkpoint serialization: read-only access to all panes
+    [[nodiscard]] const std::unordered_map<KeyWindow, Pane, KeyWindowHash>& Panes() const {
+        return panes_;
+    }
+
+    // For checkpoint restoration: insert a pane directly
+    void RestorePane(const std::string& key, const Window& window, int64_t sum, uint64_t count);
+
 private:
     std::unordered_map<KeyWindow, Pane, KeyWindowHash> panes_;
     Duration allowed_lateness_{0};

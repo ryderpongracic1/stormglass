@@ -124,4 +124,11 @@ std::vector<Window> KeyedWindowState::AllWindows() const {
     return {windows.begin(), windows.end()};
 }
 
+void KeyedWindowState::RestorePane(const std::string& key, const Window& window,
+                                    int64_t sum, uint64_t count) {
+    auto& pane = panes_[KeyWindow{key, window}];
+    pane.sum = sum;
+    pane.count = count;
+}
+
 } // namespace stormglass

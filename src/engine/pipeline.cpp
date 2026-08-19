@@ -21,9 +21,46 @@ Pipeline::Pipeline(std::unique_ptr<Source> source,
     }
 }
 
+bool Pipeline::checkpointing_enabled() const {
+    return !config_.checkpoint_dir.empty() && config_.checkpoint_interval > 0;
+}
+
+void Pipeline::TryRestore() {
+    CheckpointReader reader(config_.checkpoint_dir);
+    auto data = reader.LoadLatest();
+    if (!data.has_value()) return;
+
+    // Restore pane state
+    for (const auto& entry : data->panes) {
+        state_.RestorePane(entry.key, entry.window, entry.sum, entry.count);
+    }
+
+    // Restore watermark
+    watermark_.Advance(data->watermark);
+
+    // Seek source past the checkpointed offset
+    source_->Seek(data->offset);
+    restored_offset_ = data->offset;
+}
+
+void Pipeline::WriteCheckpoint(uint64_t offset, Stats& stats) {
+    CheckpointWriter writer(config_.checkpoint_dir);
+    if (writer.WriteCheckpoint(offset, watermark_.Current(), state_)) {
+        stats.checkpoints_written++;
+    }
+}
+
 Pipeline::Stats Pipeline::Run() {
     Stats stats{};
     bool use_lateness = config_.allowed_lateness.count() > 0;
+
+    // Attempt restore before processing
+    if (checkpointing_enabled()) {
+        TryRestore();
+        if (restored_offset_ > 0) {
+            stats.records_replayed = restored_offset_;
+        }
+    }
 
     while (auto batch = source_->Next()) {
         for (auto& item : batch->items) {
@@ -49,6 +86,17 @@ Pipeline::Stats Pipeline::Run() {
                     if (any_dropped) stats.late_records_dropped++;
                     if (any_late_accepted) stats.late_records_accepted++;
                     stats.records_processed++;
+
+                    // Checkpoint trigger based on record count
+                    if (checkpointing_enabled()) {
+                        records_since_checkpoint_++;
+                        if (records_since_checkpoint_ >= config_.checkpoint_interval) {
+                            records_since_checkpoint_ = 0;
+                            // Use records_processed as checkpoint offset — this is the
+                            // exact count of records whose effects are in the state.
+                            WriteCheckpoint(stats.records_processed, stats);
+                        }
+                    }
                 },
                 [&](const ControlRecord& c) {
                     if (c.type == ControlType::kWatermark) {
@@ -86,7 +134,6 @@ Pipeline::Stats Pipeline::Run() {
 
     // Final flush: fire all remaining windows
     if (use_lateness) {
-        // Re-emit any pending re-fires
         for (auto& w : state_.RefiredWindows()) {
             for (auto& result : state_.FireWindow(w)) {
                 sink_->Emit(result);
@@ -94,7 +141,6 @@ Pipeline::Stats Pipeline::Run() {
             stats.windows_refired++;
         }
         state_.ClearRefired();
-        // Fire windows that were never fired
         for (auto& w : state_.AllWindows()) {
             if (!state_.IsFired(w)) {
                 for (auto& result : state_.FireWindow(w)) {
@@ -103,7 +149,6 @@ Pipeline::Stats Pipeline::Run() {
                 stats.windows_fired++;
             }
         }
-        // Clean up all remaining state
         auto remaining = state_.AllWindows();
         state_.GarbageCollect(remaining);
     } else {
