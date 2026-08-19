@@ -97,8 +97,10 @@ Pipeline::Stats Pipeline::Run() {
                         records_since_checkpoint_++;
                         if (records_since_checkpoint_ >= config_.checkpoint_interval) {
                             records_since_checkpoint_ = 0;
-                            // Use records_processed as checkpoint offset — this is the
-                            // exact count of records whose effects are in the state.
+                            // Checkpoint offset must be ABSOLUTE: restored_offset_
+                            // (records covered by the checkpoint we restored from, if any)
+                            // plus records processed in this run. Using a relative offset
+                            // here caused data loss on a second crash (see DoubleCrashRestore).
                             WriteCheckpoint(restored_offset_ + stats.records_processed, stats);
                         }
                     }
