@@ -3,10 +3,14 @@
 #include "nemesis/nemesis.h"
 #include "engine/pipeline.h"
 #include "source/generator.h"
+#include "source/stopping_source.h"
 #include "sink/memory_sink.h"
 #include "window/tumbling.h"
+#include "oracle/oracle.h"
+#include "nemesis/nemesis.h"
 
 #include <algorithm>
+#include <map>
 #include <filesystem>
 
 using namespace stormglass;
@@ -133,4 +137,108 @@ TEST(NemesisTest, MultiSeedStress) {
             << "Seed " << seed << " failed: " << result.failure_detail;
         EXPECT_EQ(result.missing_results, 0u) << "Seed " << seed;
     }
+}
+
+TEST(Nemesis, DoubleCrashRestore) {
+    // Verifies that after restore, checkpoint offset is absolute.
+    // A second crash + third restore produces correct combined results.
+    
+    char tmpl[] = "/tmp/stormglass_nemesis_XXXXXX";
+    std::string tmp_dir = ::mkdtemp(tmpl);
+    
+    const uint64_t total_records = 30000;
+    const uint64_t checkpoint_interval = 5000;
+    const uint64_t crash1_at = 12000;
+    const uint64_t crash2_at = 8000;
+    
+    GeneratorConfig gen_config;
+    gen_config.seed = 99;
+    gen_config.num_records = total_records;
+    gen_config.num_keys = 10;
+    gen_config.max_disorder = Duration{500};
+    gen_config.batch_size = 256;
+    gen_config.watermark_interval = 50;
+    
+    PipelineConfig pipe_config;
+    pipe_config.checkpoint_dir = tmp_dir;
+    pipe_config.checkpoint_interval = checkpoint_interval;
+    
+    // Collect results across all runs
+    std::map<std::pair<std::string, int64_t>, std::pair<int64_t, uint64_t>> combined;
+    
+    // --- First run: crash at 12000 records ---
+    {
+        auto source = std::make_unique<StoppingSource>(
+            std::make_unique<DeterministicGenerator>(gen_config), crash1_at);
+        auto assigner = std::make_unique<TumblingAssigner>(Duration{1000});
+        auto sink = std::make_unique<MemorySink>();
+        auto* sink_ptr = sink.get();
+        Pipeline pipeline(std::move(source), std::move(assigner), std::move(sink), pipe_config);
+        auto stats = pipeline.Run();
+        EXPECT_EQ(stats.records_processed, crash1_at);
+        EXPECT_GE(stats.checkpoints_written, 2u);
+        for (auto& r : sink_ptr->Results()) {
+            auto key = std::make_pair(r.key, r.window.start.time_since_epoch().count());
+            combined[key] = {r.result.value, r.result.count};
+        }
+    }
+    
+    // --- Second run: restores, crashes after 8000 more ---
+    {
+        auto source = std::make_unique<StoppingSource>(
+            std::make_unique<DeterministicGenerator>(gen_config), crash2_at);
+        auto assigner = std::make_unique<TumblingAssigner>(Duration{1000});
+        auto sink = std::make_unique<MemorySink>();
+        auto* sink_ptr = sink.get();
+        Pipeline pipeline(std::move(source), std::move(assigner), std::move(sink), pipe_config);
+        auto stats = pipeline.Run();
+        EXPECT_EQ(stats.records_replayed, 10000u);
+        EXPECT_EQ(stats.records_processed, crash2_at);
+        EXPECT_GE(stats.checkpoints_written, 1u);
+        for (auto& r : sink_ptr->Results()) {
+            auto key = std::make_pair(r.key, r.window.start.time_since_epoch().count());
+            combined[key] = {r.result.value, r.result.count};  // overwrite with latest
+        }
+    }
+    
+    // --- Third run: restores from run2's checkpoint, runs to completion ---
+    {
+        auto source = std::make_unique<DeterministicGenerator>(gen_config);
+        auto assigner = std::make_unique<TumblingAssigner>(Duration{1000});
+        auto sink = std::make_unique<MemorySink>();
+        auto* sink_ptr = sink.get();
+        Pipeline pipeline(std::move(source), std::move(assigner), std::move(sink), pipe_config);
+        auto stats = pipeline.Run();
+        // Key assertion: restores from 15000 (absolute), not 5000 (relative)
+        EXPECT_EQ(stats.records_replayed, 15000u);
+        EXPECT_EQ(stats.records_processed, total_records - 15000u);
+        for (auto& r : sink_ptr->Results()) {
+            auto key = std::make_pair(r.key, r.window.start.time_since_epoch().count());
+            combined[key] = {r.result.value, r.result.count};
+        }
+    }
+    
+    // Oracle: compute expected results for full dataset
+    DeterministicGenerator oracle_gen(gen_config);
+    Oracle oracle(OracleConfig{.window_size = Duration{1000}});
+    while (auto batch = oracle_gen.Next()) {
+        for (auto& item : batch->items) {
+            if (auto* r = std::get_if<Record>(&item)) {
+                oracle.AddRecord(*r);
+            }
+        }
+    }
+    auto oracle_results = oracle.ComputeResults();
+    
+    // Verify: every oracle result appears in combined output (at-least-once)
+    uint64_t missing = 0;
+    for (auto& r : oracle_results) {
+        auto key = std::make_pair(r.key, r.window.start.time_since_epoch().count());
+        if (combined.find(key) == combined.end()) {
+            missing++;
+        }
+    }
+    EXPECT_EQ(missing, 0u) << "Double-crash-restore lost " << missing << " results";
+    
+    std::filesystem::remove_all(tmp_dir);
 }

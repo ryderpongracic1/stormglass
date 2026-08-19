@@ -3,3 +3,4 @@ build-release/
 cmake-build-*/
 .cache/
 compile_commands.json
+build-nossan/

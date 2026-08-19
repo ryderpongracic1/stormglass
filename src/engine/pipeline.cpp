@@ -94,7 +94,7 @@ Pipeline::Stats Pipeline::Run() {
                             records_since_checkpoint_ = 0;
                             // Use records_processed as checkpoint offset — this is the
                             // exact count of records whose effects are in the state.
-                            WriteCheckpoint(stats.records_processed, stats);
+                            WriteCheckpoint(restored_offset_ + stats.records_processed, stats);
                         }
                     }
                 },

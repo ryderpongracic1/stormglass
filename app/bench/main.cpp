@@ -104,7 +104,7 @@ static void BenchmarkPipeline(uint64_t num_records) {
     config.max_disorder = Duration{5000};
 
     auto source = std::make_unique<DeterministicGenerator>(config);
-    auto assigner = std::make_unique<TumblingAssigner>(Duration{1'000'000}); // 1 second windows
+    auto assigner = std::make_unique<TumblingAssigner>(Duration{1000}); // 1 second tumbling windows
     auto sink = std::make_unique<MemorySink>();
 
     Pipeline pipeline(std::move(source), std::move(assigner), std::move(sink));

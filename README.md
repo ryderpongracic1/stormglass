@@ -2,7 +2,7 @@
 
 Event-time stream processing engine with verified windowed aggregation semantics.
 
-Single-process event-time stream processor. Tumbling and sliding windows, bounded out-of-orderness watermarks, at-least-once delivery via atomic checkpoint/restore. Correctness verified by differential oracle testing (100 seeds, zero mismatches) and nemesis crash injection (20 runs, zero data loss).
+Single-process event-time stream processor. Tumbling and sliding windows, bounded out-of-orderness watermarks, at-least-once delivery via atomic checkpoint/restore. Correctness verified by differential oracle testing (100 seeds, zero mismatches) and nemesis stop-restart testing (20 runs, zero data loss).
 
 ## What this proves
 
@@ -35,8 +35,8 @@ Source → [Watermark] → Keyed Window Operator → Sink
 
 | Metric | Value | How measured |
 |--------|-------|--------------|
-| Pipeline throughput | 3.0 M records/sec | 1M records, Release -O3, tumbling 1s windows |
-| SIMD kernel speedup | 1.55× | AVX2 sum vs scalar, 1M elements, 100 iterations |
+| Pipeline throughput | 1.3–1.7 M records/sec | 1M records, tumbling 1s (1000 windows fired), Release -O3, 4-vCPU Xeon |
+| SIMD kernel speedup | 1.9–2.4× | AVX2 sum vs scalar, 1M int64 elements, 100 iterations (shared cloud vCPU) |
 | Checkpoint pause | <1ms | Atomic snapshot of 1000 panes (10 keys × 100 windows) |
 
 ## Verification
@@ -44,12 +44,12 @@ Source → [Watermark] → Keyed Window Operator → Sink
 ```
 Oracle differential: 100 seeds × 10K records = 0 mismatches
 Nemesis crash test:  20 runs × kill-between-checkpoints = 0 missing results
-Duplicate budget:    800 total across 20 crash/restore cycles (at-least-once by design)
+Duplicate budget:    40 per stop-restart cycle (structural: records between last checkpoint and stop point are replayed)
 ```
 
 The oracle computes expected results naively — no watermarks, just group-by-window over the full dataset. This is obviously correct and serves as the reference. The engine processes the same records with bounded disorder and watermark-driven firing. Zero mismatches means the temporal logic produces identical results to batch computation.
 
-Nemesis kills the process at targeted phases (mid-aggregation, mid-checkpoint, post-checkpoint-pre-ack), restores from the last checkpoint, and verifies all oracle-expected results appear in the output. Duplicates are counted, not suppressed — an idempotent sink upgrades to effectively-once.
+Nemesis stops the pipeline at targeted record counts (between checkpoints, at checkpoint boundaries, mid-emission), then restarts a fresh pipeline that restores from the last checkpoint. Combined output is verified against the oracle: every expected result must appear (at-least-once). Double-crash scenarios are also tested. Duplicates are counted, not suppressed — an idempotent sink upgrades to effectively-once.
 
 ## Reproduce
 
@@ -66,6 +66,7 @@ make bench                           # Release throughput numbers
 - At-least-once, not exactly-once (idempotent sink upgrades to effectively-once; not built)
 - Checkpoint pauses the operator (upgrade path: clone-then-serialize-async)
 - No persistent source integration (v2: Postgres CDC via logical decoding)
+- Checkpoint does not persist fired-window bookkeeping — after restore with allowed_lateness, previously-fired windows may re-fire (acceptable under at-least-once, but increases duplicate count)
 - SIMD kernels proven in isolation; pipeline uses scalar per-pane accumulation (vectorized window operator is the v2 optimization)
 
 ## Tech stack
