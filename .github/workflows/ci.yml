@@ -20,4 +20,4 @@ jobs:
       - name: Build
         run: cmake --build build -j$(nproc)
       - name: Bench
-        run: ./build/app/bench/stormglass_bench
+        run: ./build/app/stormglass_bench
