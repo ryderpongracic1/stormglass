@@ -1,6 +1,7 @@
-.PHONY: build test bench clean configure
+.PHONY: build test bench oracle nemesis clean configure release
 
 BUILD_DIR := build
+RELEASE_DIR := build-release
 
 configure:
 	cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug -DSTORMGLASS_SANITIZERS=ON
@@ -11,10 +12,18 @@ build: configure
 test: build
 	cd $(BUILD_DIR) && ctest --output-on-failure
 
-bench:
-	cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DSTORMGLASS_BENCH=ON
-	cmake --build build-release -j$$(nproc)
-	./build-release/app/bench/stormglass_bench
+release:
+	cmake -B $(RELEASE_DIR) -DCMAKE_BUILD_TYPE=Release
+	cmake --build $(RELEASE_DIR) -j$$(nproc)
+
+bench: release
+	./$(RELEASE_DIR)/app/stormglass_bench
+
+oracle: release
+	./$(RELEASE_DIR)/app/stormglass_oracle --seeds 100 --records 10000
+
+nemesis: release
+	./$(RELEASE_DIR)/app/stormglass_nemesis --seeds 20 --verbose
 
 clean:
-	rm -rf $(BUILD_DIR) build-release
+	rm -rf $(BUILD_DIR) $(RELEASE_DIR)
