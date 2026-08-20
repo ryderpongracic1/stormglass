@@ -44,8 +44,11 @@ Source → [Watermark | Checkpoint Barrier] → Keyed Window Operator → Sink
 Oracle differential:  100 seeds × 10K records = 0 mismatches
 Lateness matrix:      {tumbling, sliding} × {L=0, L=2s} × {bounded, heavy-tailed} = all pass;
                       in heavy-tailed cells the engine and oracle agree exactly on drop counts
-                      (7294 tumbling / 7770 sliding per 20 seeds) with thousands of
-                      within-lateness re-fires — late data is genuinely exercised, by construction
+                      with thousands of within-lateness re-fires — late data is genuinely
+                      exercised, by construction. (Absolute counts are stdlib-specific because
+                      std::uniform_int_distribution is implementation-defined: 7294/7770 per
+                      20 seeds on libstdc++/Linux, 7227/7771 on libc++/macOS — the invariant
+                      engine_drop == oracle_drop holds in every cell on both)
 Nemesis (real crash): 20 fork+SIGKILL runs between checkpoints + 6 killed mid-checkpoint-write
                       = 0 missing results; every mid-write kill leaves a real torn .ckpt.tmp
                       that recovery discards before falling back to the last valid checkpoint

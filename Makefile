@@ -7,14 +7,14 @@ configure:
 	cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug -DSTORMGLASS_SANITIZERS=ON
 
 build: configure
-	cmake --build $(BUILD_DIR) -j$$(nproc)
+	cmake --build $(BUILD_DIR) -j$$(getconf _NPROCESSORS_ONLN)
 
 test: build
 	cd $(BUILD_DIR) && ctest --output-on-failure
 
 release:
 	cmake -B $(RELEASE_DIR) -DCMAKE_BUILD_TYPE=Release
-	cmake --build $(RELEASE_DIR) -j$$(nproc)
+	cmake --build $(RELEASE_DIR) -j$$(getconf _NPROCESSORS_ONLN)
 
 bench: release
 	./$(RELEASE_DIR)/app/stormglass_bench

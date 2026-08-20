@@ -1,5 +1,6 @@
 #include "nemesis/nemesis.h"
 
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,7 +30,7 @@ int RunInProcess(uint64_t num_seeds, uint64_t num_records,
     if (phase == NemesisPhase::kMidCheckpoint) phase_name = "mid-checkpoint";
     else if (phase == NemesisPhase::kMidEmission) phase_name = "mid-emission";
 
-    std::printf("Nemesis test (in-process stop-restart): %lu runs, kill %s\n",
+    std::printf("Nemesis test (in-process stop-restart): %" PRIu64 " runs, kill %s\n",
                 num_seeds, phase_name);
 
     uint64_t passed = 0, total_duplicates = 0, total_missing = 0;
@@ -43,7 +44,7 @@ int RunInProcess(uint64_t num_seeds, uint64_t num_records,
 
         auto result = RunNemesis(config);
         if (verbose) {
-            std::printf("  [run %lu/%lu] %s (killed at %lu, restored, %lu duplicates, %lu missing)",
+            std::printf("  [run %" PRIu64 "/%" PRIu64 "] %s (killed at %" PRIu64 ", restored, %" PRIu64 " duplicates, %" PRIu64 " missing)",
                         i + 1, num_seeds, result.passed ? "PASS" : "FAIL",
                         result.records_before_kill, result.duplicates_at_sink,
                         result.missing_results);
@@ -57,9 +58,9 @@ int RunInProcess(uint64_t num_seeds, uint64_t num_records,
         total_missing += result.missing_results;
     }
 
-    std::printf("\nResult: %lu/%lu passed, %lu missing results across all runs\n",
+    std::printf("\nResult: %" PRIu64 "/%" PRIu64 " passed, %" PRIu64 " missing results across all runs\n",
                 passed, num_seeds, total_missing);
-    std::printf("Total duplicates: %lu (at-least-once working as designed)\n",
+    std::printf("Total duplicates: %" PRIu64 " (at-least-once working as designed)\n",
                 total_duplicates);
     return (passed == num_seeds) ? 0 : 1;
 }
@@ -69,7 +70,7 @@ int RunRealKill(uint64_t num_seeds, uint64_t num_records, uint64_t checkpoint_in
     const char* point_name =
         (point == RealKillPoint::kMidCheckpoint) ? "mid-checkpoint" : "between-checkpoints";
 
-    std::printf("Nemesis test (REAL fork+SIGKILL): %lu runs, kill %s\n",
+    std::printf("Nemesis test (REAL fork+SIGKILL): %" PRIu64 " runs, kill %s\n",
                 num_seeds, point_name);
 
     uint64_t passed = 0, total_duplicates = 0, total_missing = 0;
@@ -93,9 +94,9 @@ int RunRealKill(uint64_t num_seeds, uint64_t num_records, uint64_t checkpoint_in
         total_missing += result.missing_results;
 
         if (verbose) {
-            std::printf("  [run %lu/%lu] %s killed=%s flush=%s stale_tmp=%s "
-                        "restored@%lu pre=%lu post=%lu union=%lu oracle=%lu "
-                        "missing=%lu dup=%lu attempts=%u",
+            std::printf("  [run %" PRIu64 "/%" PRIu64 "] %s killed=%s flush=%s stale_tmp=%s "
+                        "restored@%" PRIu64 " pre=%" PRIu64 " post=%" PRIu64 " union=%" PRIu64 " oracle=%" PRIu64 " "
+                        "missing=%" PRIu64 " dup=%" PRIu64 " attempts=%u",
                         i + 1, num_seeds, result.passed ? "PASS" : "FAIL",
                         result.killed_by_sigkill ? "SIGKILL" : "no",
                         result.final_flush_completed ? "yes" : "no",
@@ -111,12 +112,12 @@ int RunRealKill(uint64_t num_seeds, uint64_t num_records, uint64_t checkpoint_in
         }
     }
 
-    std::printf("\nResult: %lu/%lu passed, %lu missing results across all runs\n",
+    std::printf("\nResult: %" PRIu64 "/%" PRIu64 " passed, %" PRIu64 " missing results across all runs\n",
                 passed, num_seeds, total_missing);
-    std::printf("Kill evidence: %lu/%lu terminated by SIGKILL, %lu clean-flush escapes, "
-                "%lu interrupted checkpoint writes (stale .tmp recovered)\n",
+    std::printf("Kill evidence: %" PRIu64 "/%" PRIu64 " terminated by SIGKILL, %" PRIu64 " clean-flush escapes, "
+                "%" PRIu64 " interrupted checkpoint writes (stale .tmp recovered)\n",
                 kills_confirmed, num_seeds, clean_flushes, stale_tmps);
-    std::printf("Total duplicates: %lu (at-least-once; idempotent sink upgrades to effectively-once)\n",
+    std::printf("Total duplicates: %" PRIu64 " (at-least-once; idempotent sink upgrades to effectively-once)\n",
                 total_duplicates);
     return (passed == num_seeds && total_missing == 0) ? 0 : 1;
 }
