@@ -2,7 +2,7 @@
 
 Event-time stream processing engine with verified windowed aggregation semantics.
 
-Single-process event-time stream processor. Tumbling and sliding windows, bounded out-of-orderness watermarks, at-least-once delivery via atomic checkpoint/restore. Correctness verified by differential oracle testing (100 seeds, zero mismatches) and nemesis stop-restart testing (20 runs, zero data loss).
+Single-process event-time stream processor. Tumbling and sliding windows, bounded out-of-orderness watermarks, at-least-once delivery via atomic checkpoint/restore. Correctness verified by differential oracle testing (100 seeds, zero mismatches; heavy-tailed late-data matrix) and a crash nemesis that fork()s the pipeline and SIGKILLs it mid-stream (0 missing results, including kills during checkpoint writes).
 
 ## What this proves
 
@@ -35,20 +35,25 @@ Source → [Watermark | Checkpoint Barrier] → Keyed Window Operator → Sink
 
 | Metric | Value | How measured |
 |--------|-------|--------------|
-| Pipeline throughput | median ~1.8 M rec/s (observed 1.3–3.1) | 1M records, tumbling 1s (1000 windows fired), Release -O3 -march=native, 8 runs on shared 4-vCPU Xeon 6975P-C. Wide range is CPU-scheduling noise on shared infra |
-| Checkpoint pause | ~7 ms at 1000 panes (~12 ms at 10K) | Direct measurement in `make bench` (Checkpoint Pause section): 20 writes each of serialize + fsync + rename + dir-fsync. Dominated by fsync, not serialization |
+| Pipeline throughput | median ~9.0 M rec/s (observed 8.2–9.1) | 1M records, tumbling 1s (1000 windows fired), Release -O3 -march=native, 8 runs on shared 4-vCPU Xeon 6975P-C. Earlier builds measured ~1.8 M rec/s with 1.3–3.1 spread; the window-end-ordered pane index removed the per-watermark full-pane scan, which was both the bottleneck and the variance source |
+| Checkpoint pause | ~5.6 ms at 1000 panes (~9.2 ms at 10K) | Direct measurement in `make bench` (Checkpoint Pause section): 20 writes each of serialize + fsync + rename + dir-fsync. Dominated by fsync, not serialization |
 
 ## Verification
 
 ```
-Oracle differential: 100 seeds × 10K records = 0 mismatches
-Nemesis crash test:  20 runs × kill-between-checkpoints = 0 missing results
-Duplicate budget:    40 per stop-restart cycle (structural: records between last checkpoint and stop point are replayed)
+Oracle differential:  100 seeds × 10K records = 0 mismatches
+Lateness matrix:      {tumbling, sliding} × {L=0, L=2s} × {bounded, heavy-tailed} = all pass;
+                      in heavy-tailed cells the engine and oracle agree exactly on drop counts
+                      (7294 tumbling / 7770 sliding per 20 seeds) with thousands of
+                      within-lateness re-fires — late data is genuinely exercised, by construction
+Nemesis (real crash): 20 fork+SIGKILL runs between checkpoints + 6 killed mid-checkpoint-write
+                      = 0 missing results; every mid-write kill leaves a real torn .ckpt.tmp
+                      that recovery discards before falling back to the last valid checkpoint
 ```
 
-The oracle computes expected results naively — no watermarks, just group-by-window over the full dataset. This is obviously correct and serves as the reference. The engine processes the same records with bounded disorder and watermark-driven firing. Zero mismatches means the temporal logic produces identical results to batch computation.
+The oracle computes expected results naively — no watermarks, just group-by-window over the full dataset. This is obviously correct and serves as the reference. The engine processes the same records with watermark-driven firing. The heavy-tailed disorder mode pushes a configurable fraction of records below the watermark, so the allowed-lateness re-fire and beyond-lateness drop paths are exercised for real — a guard test fails if a heavy-tailed run ever produces zero late records.
 
-Nemesis stops the pipeline at targeted record counts (between checkpoints, at checkpoint boundaries, mid-emission), then restarts a fresh pipeline that restores from the last checkpoint. Combined output is verified against the oracle: every expected result must appear (at-least-once). Double-crash scenarios are also tested. Duplicates are counted, not suppressed — an idempotent sink upgrades to effectively-once.
+The nemesis fork()s a child running the real pipeline and SIGKILLs it before the final flush (verified per run: the child never reaches its post-flush sentinel), so in-memory window state genuinely dies. Pre-crash results survive only because the sink fsyncs each emitted window — that durable output, unioned with the post-restore run, must cover the oracle exactly (at-least-once). Duplicates are counted, not suppressed; at the default checkpoint spacing the union is a clean partition (0 duplicates), and an idempotent sink upgrades to effectively-once. Double-crash restore is separately tested to pin absolute-offset checkpoint semantics.
 
 ## Reproduce
 
