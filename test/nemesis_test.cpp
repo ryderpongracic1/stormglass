@@ -242,3 +242,79 @@ TEST(Nemesis, DoubleCrashRestore) {
     
     std::filesystem::remove_all(tmp_dir);
 }
+
+
+// --- Real crash nemesis: fork() + SIGKILL ---
+
+TEST(RealKillNemesis, BetweenCheckpointsZeroMissing) {
+    RealKillConfig config{};
+    config.seed = 42;
+    config.num_records = 20000;
+    config.num_keys = 20;
+    config.checkpoint_interval = 1000;
+    config.kill_point = RealKillPoint::kBetweenCheckpoints;
+    config.target_checkpoint = 2;
+
+    auto result = RunRealKillNemesis(config);
+
+    EXPECT_TRUE(result.passed) << result.failure_detail;
+    EXPECT_EQ(result.missing_results, 0u);
+    // Evidence the crash was real: SIGKILL landed before any final flush.
+    EXPECT_TRUE(result.killed_by_sigkill);
+    EXPECT_FALSE(result.final_flush_completed);
+    // Pre-crash durable sink output survived the kill and post-restore drained.
+    EXPECT_GT(result.pre_crash_emits, 0u)
+        << "durable pre-crash output should survive SIGKILL";
+    EXPECT_GT(result.post_restore_emits, 0u);
+    EXPECT_GT(result.oracle_results, 0u);
+}
+
+TEST(RealKillNemesis, MidCheckpointRealPartialWriteRecovery) {
+    RealKillConfig config{};
+    config.seed = 77;
+    config.num_records = 40000;
+    config.num_keys = 100;
+    config.checkpoint_interval = 500;
+    config.kill_point = RealKillPoint::kMidCheckpoint;
+
+    auto result = RunRealKillNemesis(config);
+
+    EXPECT_TRUE(result.passed) << result.failure_detail;
+    EXPECT_EQ(result.missing_results, 0u);
+    EXPECT_TRUE(result.killed_by_sigkill);
+    EXPECT_FALSE(result.final_flush_completed);
+    // The kill genuinely interrupted a checkpoint write, leaving a stale .tmp
+    // that the restore path had to recover from — not a fabricated garbage file.
+    EXPECT_TRUE(result.stale_tmp_after_kill)
+        << "expected a real interrupted checkpoint .tmp after " << result.attempts
+        << " attempts";
+}
+
+TEST(RealKillNemesis, MultiRunZeroMissingCountsDuplicates) {
+    uint64_t total_missing = 0;
+    uint64_t total_duplicates = 0;
+    uint64_t kills = 0;
+
+    for (uint64_t seed = 0; seed < 3; ++seed) {
+        RealKillConfig config{};
+        config.seed = 100 + seed;
+        config.num_records = 20000;
+        config.num_keys = 20;
+        config.checkpoint_interval = 1000;
+        config.kill_point = RealKillPoint::kBetweenCheckpoints;
+        config.target_checkpoint = 2;
+
+        auto result = RunRealKillNemesis(config);
+        EXPECT_TRUE(result.passed) << "seed " << seed << ": " << result.failure_detail;
+        EXPECT_EQ(result.missing_results, 0u) << "seed " << seed;
+        total_missing += result.missing_results;
+        total_duplicates += result.duplicates;
+        if (result.killed_by_sigkill) ++kills;
+    }
+
+    EXPECT_EQ(total_missing, 0u);
+    EXPECT_EQ(kills, 3u) << "all runs must be genuine SIGKILL crashes";
+    // Duplicates are permitted (records between last checkpoint and crash are
+    // replayed). We only require them to be counted, not zero.
+    RecordProperty("total_duplicates", static_cast<int>(total_duplicates));
+}

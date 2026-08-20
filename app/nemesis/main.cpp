@@ -13,25 +13,139 @@ void PrintUsage() {
         "  --seeds N              Number of nemesis runs (default: 20)\n"
         "  --records N            Records per run (default: 50000)\n"
         "  --checkpoint-interval N  (default: 5000)\n"
-        "  --phase <mid-checkpoint|mid-emission|between>  (default: between)\n"
+        "  --phase <mid-checkpoint|mid-emission|between>  in-process phase (default: between)\n"
+        "  --real-kill            Headline mode: genuine fork() + SIGKILL crash\n"
+        "  --real-phase <between|mid-checkpoint>  real-kill point (default: between)\n"
+        "  --keys N               Keys per run, real-kill only (default: 50)\n"
         "  --verbose              Print per-run details\n"
         "  --help                 Show this help\n");
 }
+
+namespace {
+
+int RunInProcess(uint64_t num_seeds, uint64_t num_records,
+                 uint64_t checkpoint_interval, NemesisPhase phase, bool verbose) {
+    const char* phase_name = "between checkpoints";
+    if (phase == NemesisPhase::kMidCheckpoint) phase_name = "mid-checkpoint";
+    else if (phase == NemesisPhase::kMidEmission) phase_name = "mid-emission";
+
+    std::printf("Nemesis test (in-process stop-restart): %lu runs, kill %s\n",
+                num_seeds, phase_name);
+
+    uint64_t passed = 0, total_duplicates = 0, total_missing = 0;
+    for (uint64_t i = 0; i < num_seeds; ++i) {
+        NemesisConfig config{};
+        config.seed = 42 + i;
+        config.num_records = num_records;
+        config.checkpoint_interval = checkpoint_interval;
+        config.kill_phase = phase;
+        config.kill_position = 0.3 + 0.4 * (static_cast<double>(i) / static_cast<double>(num_seeds));
+
+        auto result = RunNemesis(config);
+        if (verbose) {
+            std::printf("  [run %lu/%lu] %s (killed at %lu, restored, %lu duplicates, %lu missing)",
+                        i + 1, num_seeds, result.passed ? "PASS" : "FAIL",
+                        result.records_before_kill, result.duplicates_at_sink,
+                        result.missing_results);
+            if (!result.passed && !result.failure_detail.empty()) {
+                std::printf(" — %s", result.failure_detail.c_str());
+            }
+            std::printf("\n");
+        }
+        if (result.passed) ++passed;
+        total_duplicates += result.duplicates_at_sink;
+        total_missing += result.missing_results;
+    }
+
+    std::printf("\nResult: %lu/%lu passed, %lu missing results across all runs\n",
+                passed, num_seeds, total_missing);
+    std::printf("Total duplicates: %lu (at-least-once working as designed)\n",
+                total_duplicates);
+    return (passed == num_seeds) ? 0 : 1;
+}
+
+int RunRealKill(uint64_t num_seeds, uint64_t num_records, uint64_t checkpoint_interval,
+                uint32_t num_keys, RealKillPoint point, bool verbose) {
+    const char* point_name =
+        (point == RealKillPoint::kMidCheckpoint) ? "mid-checkpoint" : "between-checkpoints";
+
+    std::printf("Nemesis test (REAL fork+SIGKILL): %lu runs, kill %s\n",
+                num_seeds, point_name);
+
+    uint64_t passed = 0, total_duplicates = 0, total_missing = 0;
+    uint64_t kills_confirmed = 0, stale_tmps = 0, clean_flushes = 0;
+
+    for (uint64_t i = 0; i < num_seeds; ++i) {
+        RealKillConfig config{};
+        config.seed = 42 + i;
+        config.num_records = num_records;
+        config.num_keys = num_keys;
+        config.checkpoint_interval = checkpoint_interval;
+        config.kill_point = point;
+
+        auto result = RunRealKillNemesis(config);
+
+        if (result.passed) ++passed;
+        if (result.killed_by_sigkill) ++kills_confirmed;
+        if (result.stale_tmp_after_kill) ++stale_tmps;
+        if (result.final_flush_completed) ++clean_flushes;
+        total_duplicates += result.duplicates;
+        total_missing += result.missing_results;
+
+        if (verbose) {
+            std::printf("  [run %lu/%lu] %s killed=%s flush=%s stale_tmp=%s "
+                        "restored@%lu pre=%lu post=%lu union=%lu oracle=%lu "
+                        "missing=%lu dup=%lu attempts=%u",
+                        i + 1, num_seeds, result.passed ? "PASS" : "FAIL",
+                        result.killed_by_sigkill ? "SIGKILL" : "no",
+                        result.final_flush_completed ? "yes" : "no",
+                        result.stale_tmp_after_kill ? "yes" : "no",
+                        result.restored_offset, result.pre_crash_emits,
+                        result.post_restore_emits, result.union_results,
+                        result.oracle_results, result.missing_results,
+                        result.duplicates, result.attempts);
+            if (!result.passed && !result.failure_detail.empty()) {
+                std::printf(" — %s", result.failure_detail.c_str());
+            }
+            std::printf("\n");
+        }
+    }
+
+    std::printf("\nResult: %lu/%lu passed, %lu missing results across all runs\n",
+                passed, num_seeds, total_missing);
+    std::printf("Kill evidence: %lu/%lu terminated by SIGKILL, %lu clean-flush escapes, "
+                "%lu interrupted checkpoint writes (stale .tmp recovered)\n",
+                kills_confirmed, num_seeds, clean_flushes, stale_tmps);
+    std::printf("Total duplicates: %lu (at-least-once; idempotent sink upgrades to effectively-once)\n",
+                total_duplicates);
+    return (passed == num_seeds && total_missing == 0) ? 0 : 1;
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
     uint64_t num_seeds = 20;
     uint64_t num_records = 50000;
     uint64_t checkpoint_interval = 5000;
+    uint32_t num_keys = 50;
     NemesisPhase phase = NemesisPhase::kBetweenCheckpoints;
+    bool real_kill = false;
+    RealKillPoint real_point = RealKillPoint::kBetweenCheckpoints;
     bool verbose = false;
+    bool records_set = false;
+    bool interval_set = false;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--seeds") == 0 && i + 1 < argc) {
             num_seeds = std::strtoull(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--records") == 0 && i + 1 < argc) {
             num_records = std::strtoull(argv[++i], nullptr, 10);
+            records_set = true;
         } else if (std::strcmp(argv[i], "--checkpoint-interval") == 0 && i + 1 < argc) {
             checkpoint_interval = std::strtoull(argv[++i], nullptr, 10);
+            interval_set = true;
+        } else if (std::strcmp(argv[i], "--keys") == 0 && i + 1 < argc) {
+            num_keys = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--phase") == 0 && i + 1 < argc) {
             ++i;
             if (std::strcmp(argv[i], "mid-checkpoint") == 0) {
@@ -42,6 +156,18 @@ int main(int argc, char* argv[]) {
                 phase = NemesisPhase::kBetweenCheckpoints;
             } else {
                 std::fprintf(stderr, "Unknown phase: %s\n", argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--real-kill") == 0) {
+            real_kill = true;
+        } else if (std::strcmp(argv[i], "--real-phase") == 0 && i + 1 < argc) {
+            ++i;
+            if (std::strcmp(argv[i], "between") == 0) {
+                real_point = RealKillPoint::kBetweenCheckpoints;
+            } else if (std::strcmp(argv[i], "mid-checkpoint") == 0) {
+                real_point = RealKillPoint::kMidCheckpoint;
+            } else {
+                std::fprintf(stderr, "Unknown real-phase: %s\n", argv[i]);
                 return 1;
             }
         } else if (std::strcmp(argv[i], "--verbose") == 0) {
@@ -56,48 +182,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    const char* phase_name = "between checkpoints";
-    if (phase == NemesisPhase::kMidCheckpoint) phase_name = "mid-checkpoint";
-    else if (phase == NemesisPhase::kMidEmission) phase_name = "mid-emission";
-
-    std::printf("Nemesis test: %lu runs, kill %s\n", num_seeds, phase_name);
-
-    uint64_t passed = 0;
-    uint64_t total_duplicates = 0;
-    uint64_t total_missing = 0;
-
-    for (uint64_t i = 0; i < num_seeds; ++i) {
-        NemesisConfig config{};
-        config.seed = 42 + i;  // Different seed each run
-        config.num_records = num_records;
-        config.checkpoint_interval = checkpoint_interval;
-        config.kill_phase = phase;
-        config.kill_position = 0.3 + 0.4 * (static_cast<double>(i) / static_cast<double>(num_seeds));
-
-        auto result = RunNemesis(config);
-
-        if (verbose) {
-            std::printf("  [run %lu/%lu] %s (killed at %lu, restored, %lu duplicates, %lu missing)",
-                        i + 1, num_seeds,
-                        result.passed ? "PASS" : "FAIL",
-                        result.records_before_kill,
-                        result.duplicates_at_sink,
-                        result.missing_results);
-            if (!result.passed && !result.failure_detail.empty()) {
-                std::printf(" — %s", result.failure_detail.c_str());
-            }
-            std::printf("\n");
-        }
-
-        if (result.passed) ++passed;
-        total_duplicates += result.duplicates_at_sink;
-        total_missing += result.missing_results;
+    if (real_kill) {
+        // Real-kill defaults favor frequent, catchable checkpoints. Only override
+        // when the user set them explicitly.
+        if (!num_records || (!records_set && num_records == 50000)) num_records = 40000;
+        if (!interval_set && checkpoint_interval == 5000) checkpoint_interval = 1000;
+        return RunRealKill(num_seeds, num_records, checkpoint_interval, num_keys,
+                           real_point, verbose);
     }
 
-    std::printf("\nResult: %lu/%lu passed, %lu missing results across all runs\n",
-                passed, num_seeds, total_missing);
-    std::printf("Total duplicates: %lu (at-least-once working as designed)\n",
-                total_duplicates);
-
-    return (passed == num_seeds) ? 0 : 1;
+    return RunInProcess(num_seeds, num_records, checkpoint_interval, phase, verbose);
 }
