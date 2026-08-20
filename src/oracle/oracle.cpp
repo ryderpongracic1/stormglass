@@ -45,30 +45,28 @@ std::vector<Window> Oracle::AssignWindows(Timestamp event_time) const {
 }
 
 void Oracle::AddRecord(const Record& record) {
-    // Check for late-data drop prediction
-    if (config_.allowed_lateness > Duration{0}) {
-        auto windows = AssignWindows(record.event_time);
-        bool all_dropped = true;
-        for (const auto& w : windows) {
-            // A record is dropped if its window has already been closed:
-            // window.end + allowed_lateness <= current_watermark
-            if (w.end + config_.allowed_lateness > current_watermark_) {
-                all_dropped = false;
-                break;
-            }
-        }
-        if (all_dropped && current_watermark_ > Timestamp::min()) {
-            ++predicted_drops_;
-            return;  // Don't accumulate dropped records
-        }
-    }
-
-    // Accumulate into panes
+    // Predict per-window drops using the engine's rule: a window is closed once
+    // watermark >= window.end + allowed_lateness. This is evaluated per window
+    // (a sliding-window record can be dropped from an already-closed window while
+    // still landing in a younger, open one) and mirrors the engine's per-record
+    // "any window dropped" counter.
     auto windows = AssignWindows(record.event_time);
+    bool any_dropped = false;
+
     for (const auto& w : windows) {
+        bool dropped = current_watermark_ > Timestamp::min() &&
+                       current_watermark_ >= w.end + config_.allowed_lateness;
+        if (dropped) {
+            any_dropped = true;
+            continue;  // record excluded from this closed window
+        }
         auto& pane = data_[record.key][w];
         pane.sum += record.value;
         pane.count++;
+    }
+
+    if (any_dropped) {
+        ++predicted_drops_;
     }
 }
 

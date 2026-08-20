@@ -3,11 +3,13 @@
 #include "engine/pipeline.h"
 #include "sink/memory_sink.h"
 #include "source/generator.h"
+#include "window/sliding.h"
 #include "window/tumbling.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <memory>
+#include <unordered_map>
 #include <variant>
 
 namespace stormglass {
@@ -87,13 +89,34 @@ static void SortResults(std::vector<WindowResult>& results) {
               });
 }
 
+std::vector<WindowResult> DedupEngineResults(const std::vector<WindowResult>& results) {
+    std::unordered_map<KeyWindow, WindowResult, KeyWindowHash> best;
+    best.reserve(results.size());
+    for (const auto& r : results) {
+        KeyWindow kw{r.key, r.window};
+        auto it = best.find(kw);
+        if (it == best.end() || r.result.count > it->second.result.count) {
+            best[kw] = r;
+        }
+    }
+
+    std::vector<WindowResult> out;
+    out.reserve(best.size());
+    for (auto& [kw, r] : best) {
+        out.push_back(r);
+    }
+    return out;
+}
+
 DifferentialResult RunDifferential(const DifferentialConfig& config) {
     DifferentialResult result{};
 
-    for (uint64_t seed = 1; seed <= config.num_seeds; ++seed) {
+    const bool sliding = config.assigner == AssignerType::kSliding;
+    const uint64_t last_seed = config.seed_start + config.num_seeds - 1;
+
+    for (uint64_t seed = config.seed_start; seed <= last_seed; ++seed) {
         result.seeds_tested++;
 
-        // --- Engine path ---
         GeneratorConfig gen_config{
             .seed = seed,
             .num_keys = config.num_keys,
@@ -101,29 +124,41 @@ DifferentialResult RunDifferential(const DifferentialConfig& config) {
             .max_disorder = config.max_disorder,
             .batch_size = 1024,
             .watermark_interval = 100,
+            .disorder_mode = config.disorder_mode,
+            .late_fraction = config.late_fraction,
+            .late_tail = config.late_tail,
         };
 
+        auto make_assigner = [&]() -> std::unique_ptr<WindowAssigner> {
+            if (sliding) {
+                return std::make_unique<SlidingAssigner>(config.window_size, config.slide);
+            }
+            return std::make_unique<TumblingAssigner>(config.window_size);
+        };
+
+        // --- Engine path ---
         auto engine_sink = std::make_unique<MemorySink>();
         auto* sink_ptr = engine_sink.get();
 
         auto pipeline = Pipeline(
             std::make_unique<DeterministicGenerator>(gen_config),
-            std::make_unique<TumblingAssigner>(config.window_size),
-            std::move(engine_sink));
+            make_assigner(),
+            std::move(engine_sink),
+            PipelineConfig{.allowed_lateness = config.allowed_lateness});
 
         auto stats = pipeline.Run();
 
-        auto engine_results = sink_ptr->Results();
+        auto engine_results = DedupEngineResults(sink_ptr->Results());
         SortResults(engine_results);
 
         // --- Oracle path ---
         Oracle oracle(OracleConfig{
             .window_size = config.window_size,
-            .slide = Duration{0},
+            .slide = sliding ? config.slide : Duration{0},
             .allowed_lateness = config.allowed_lateness,
         });
 
-        // Replay the same generator, feeding records to oracle
+        // Replay the same generator, feeding records and watermarks to oracle
         DeterministicGenerator replay_gen(gen_config);
         while (auto batch = replay_gen.Next()) {
             for (const auto& item : batch->items) {
@@ -140,15 +175,36 @@ DifferentialResult RunDifferential(const DifferentialConfig& config) {
 
         auto oracle_results = oracle.ComputeResults();
 
-        // --- Compare ---
+        // Accumulate late-data evidence
+        result.engine_late_dropped += stats.late_records_dropped;
+        result.engine_late_accepted += stats.late_records_accepted;
+        result.engine_windows_refired += stats.windows_refired;
+        result.oracle_predicted_drops += oracle.PredictedDropCount();
+
+        // --- Compare window results ---
         auto mismatch = CompareResults(engine_results, oracle_results);
+
+        // --- Drop-count contract ---
+        // With allowed_lateness > 0 the engine actually drops beyond-deadline
+        // records and both sides must agree on the count. With lateness == 0 the
+        // engine takes the no-lateness path (which re-accumulates rather than
+        // counting drops), so its counter is 0 by construction; the oracle's
+        // predicted drops are still reported as evidence but not asserted equal.
+        if (mismatch.empty() && config.allowed_lateness > Duration{0} &&
+            stats.late_records_dropped != oracle.PredictedDropCount()) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "drop-count mismatch: engine=%llu, oracle=%llu",
+                          static_cast<unsigned long long>(stats.late_records_dropped),
+                          static_cast<unsigned long long>(oracle.PredictedDropCount()));
+            mismatch = buf;
+        }
 
         if (mismatch.empty()) {
             result.seeds_passed++;
             if (config.verbose) {
-                std::printf("  [seed %llu/%llu] PASS (%zu results)\n",
+                std::printf("  [seed %llu] PASS (%zu results)\n",
                             static_cast<unsigned long long>(seed),
-                            static_cast<unsigned long long>(config.num_seeds),
                             engine_results.size());
             }
         } else {
@@ -162,9 +218,8 @@ DifferentialResult RunDifferential(const DifferentialConfig& config) {
                 result.failure_detail = buf;
             }
             if (config.verbose) {
-                std::printf("  [seed %llu/%llu] FAIL: %s\n",
+                std::printf("  [seed %llu] FAIL: %s\n",
                             static_cast<unsigned long long>(seed),
-                            static_cast<unsigned long long>(config.num_seeds),
                             mismatch.c_str());
             }
         }

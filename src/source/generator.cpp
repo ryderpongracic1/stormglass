@@ -14,12 +14,31 @@ Record DeterministicGenerator::GenerateRecord() {
     std::snprintf(key_buf, sizeof(key_buf), "key-%04u",
                   static_cast<unsigned>(offset_ % config_.num_keys));
 
-    // Event time: monotonically increasing base (1ms apart) + jitter in [-max_disorder, 0]
+    // Event time: monotonically increasing base (1ms apart) + disorder.
     auto base_ms = static_cast<int64_t>(offset_);  // 1ms per record
-    std::uniform_int_distribution<int64_t> jitter_dist(
-        -config_.max_disorder.count(), 0);
-    auto jitter = jitter_dist(rng_);
-    auto event_ms = base_ms + jitter;
+    int64_t event_ms;
+    if (config_.disorder_mode == DisorderMode::kHeavyTailed &&
+        config_.late_fraction > 0.0) {
+        // Draw order is fixed at 3 rng draws per record in this mode
+        // (coin, then tail-or-jitter, then value) so Seek() replay stays stable.
+        std::bernoulli_distribution late_coin(config_.late_fraction);
+        bool is_late = late_coin(rng_);
+        if (is_late) {
+            // Push strictly beyond the disorder bound so the record lands below
+            // the emitted watermark (wm = max_seen - max_disorder) and is late.
+            auto tail_max = std::max<int64_t>(1, config_.late_tail.count());
+            std::uniform_int_distribution<int64_t> tail_dist(1, tail_max);
+            event_ms = base_ms - config_.max_disorder.count() - tail_dist(rng_);
+        } else {
+            std::uniform_int_distribution<int64_t> jitter_dist(
+                -config_.max_disorder.count(), 0);
+            event_ms = base_ms + jitter_dist(rng_);
+        }
+    } else {
+        std::uniform_int_distribution<int64_t> jitter_dist(
+            -config_.max_disorder.count(), 0);
+        event_ms = base_ms + jitter_dist(rng_);
+    }
     if (event_ms < 0) event_ms = 0;
 
     // Value: uniform int64 in [1, 1000]
