@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace stormglass {
 
@@ -16,6 +17,21 @@ struct PartitionedPipelineConfig {
     uint32_t num_workers = 4;         // N worker threads
     Duration allowed_lateness{0};
     std::size_t queue_capacity = 8192; // per-worker bounded queue depth
+
+    // Distributed-checkpoint root. Empty (default) = no checkpointing, in which
+    // case every field below is inert and the engine behaves exactly as in
+    // Phase 0-2. When set, each worker k snapshots on every broadcast barrier
+    // into <checkpoint_dir>/p<k> (see distributed_checkpoint.h), and Run() first
+    // restores from the highest COMPLETE global checkpoint and seeks the source
+    // past it.
+    std::string checkpoint_dir;
+
+    // Optional per-worker sink factory. When set, worker k emits directly to
+    // worker_sink_factory(k) instead of an internal MemorySink merged into the
+    // constructor's sink at join. Used by the partitioned real-kill nemesis so
+    // each worker's pre-crash output is independently durable. Null (default)
+    // keeps the original merge-into-caller-sink path byte-for-byte.
+    std::function<std::unique_ptr<Sink>(uint32_t)> worker_sink_factory = nullptr;
 };
 
 // Multi-worker keyed-parallel windowing engine.
@@ -63,6 +79,10 @@ public:
         // the code takes a real min so multi-source needs no rewrite.
         Timestamp output_watermark{Timestamp::min()};
         uint32_t num_workers = 0;
+
+        // Checkpoint quantities (0 when checkpoint_dir is empty).
+        uint64_t checkpoints_written = 0;  // summed across workers (per-partition files)
+        uint64_t records_replayed = 0;     // offset of the complete checkpoint restored from
     };
 
     Stats Run();

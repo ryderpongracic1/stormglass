@@ -3,9 +3,13 @@
 #include "engine/bounded_queue.h"
 #include "engine/keyed_processor.h"
 #include "engine/partition_hash.h"
+#include "checkpoint/distributed_checkpoint.h"
+#include "checkpoint/reader.h"
 #include "sink/memory_sink.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <string>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -27,9 +31,14 @@ struct Worker {
     explicit Worker(std::size_t queue_capacity) : queue(queue_capacity) {}
 
     BoundedQueue<WorkerMessage> queue;
-    MemorySink sink;
+    // Worker sink: either an internal MemorySink (mem_sink non-null, merged into
+    // the caller's sink at join) or a caller-supplied durable sink (mem_sink
+    // null, self-persisting). Held by unique_ptr so both cases share one path.
+    std::unique_ptr<Sink> sink;
+    MemorySink* mem_sink = nullptr;
     std::unique_ptr<KeyedProcessor> processor;
     std::thread thread;
+    std::string ckpt_dir;  // per-partition checkpoint dir, or empty
 };
 
 } // namespace
@@ -46,15 +55,55 @@ PartitionedPipeline::PartitionedPipeline(
 
 PartitionedPipeline::Stats PartitionedPipeline::Run() {
     const uint32_t n = std::max<uint32_t>(1, config_.num_workers);
+    const bool checkpointing = !config_.checkpoint_dir.empty();
+
+    // Per-partition checkpoint directories must exist before any worker writes.
+    // create_directories is idempotent, so both the initial run and a restart
+    // (restore) run land on the same layout.
+    if (checkpointing) {
+        for (uint32_t i = 0; i < n; ++i) {
+            std::filesystem::create_directories(
+                PartitionCheckpointDir(config_.checkpoint_dir, i));
+        }
+    }
 
     // --- Build workers (each owns its state, assigner, and local sink) ---
     std::vector<std::unique_ptr<Worker>> workers;
     workers.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
         auto w = std::make_unique<Worker>(config_.queue_capacity);
+        if (checkpointing) {
+            w->ckpt_dir = PartitionCheckpointDir(config_.checkpoint_dir, i);
+        }
+        if (config_.worker_sink_factory) {
+            w->sink = config_.worker_sink_factory(i);
+        } else {
+            auto mem = std::make_unique<MemorySink>();
+            w->mem_sink = mem.get();
+            w->sink = std::move(mem);
+        }
         w->processor = std::make_unique<KeyedProcessor>(
-            assigner_factory_(), w->sink, config_.allowed_lateness);
+            assigner_factory_(), *w->sink, config_.allowed_lateness, w->ckpt_dir);
         workers.push_back(std::move(w));
+    }
+
+    // --- Restore from the highest COMPLETE global checkpoint, if any ---
+    // Each partition loads its own file for that exact offset (NOT its local
+    // latest, which may be a torn higher offset). Then the shared source is
+    // sought past the offset, so deterministic FNV-1a routing replays the
+    // remaining records to the same workers.
+    Stats stats{};
+    if (checkpointing) {
+        if (auto complete = HighestCompleteCheckpoint(config_.checkpoint_dir, n)) {
+            for (uint32_t i = 0; i < n; ++i) {
+                CheckpointReader reader(workers[i]->ckpt_dir);
+                if (auto data = reader.LoadOffset(*complete)) {
+                    workers[i]->processor->Restore(*data);
+                }
+            }
+            source_->Seek(*complete);
+            stats.records_replayed = *complete;
+        }
     }
 
     // --- Worker loop: drain queue until EndOfStream, then final-flush ---
@@ -116,12 +165,16 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
     }
 
     // --- Merge: union worker outputs into the caller's sink + aggregate stats ---
-    Stats stats{};
     stats.num_workers = n;
     Timestamp min_wm = Timestamp::max();
     for (uint32_t i = 0; i < n; ++i) {
-        for (const auto& result : workers[i]->sink.Results()) {
-            sink_->Emit(result);
+        // Internal MemorySink workers merge into the caller's sink. Workers with
+        // a caller-supplied durable sink have already persisted independently, so
+        // there is nothing to merge (mem_sink is null).
+        if (workers[i]->mem_sink) {
+            for (const auto& result : workers[i]->mem_sink->Results()) {
+                sink_->Emit(result);
+            }
         }
         const auto& ws = workers[i]->processor->stats();
         // Disjoint-key quantities sum to the single-threaded totals.
@@ -130,6 +183,7 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
         stats.windows_refired += ws.windows_refired;
         stats.late_records_accepted += ws.late_records_accepted;
         stats.late_records_dropped += ws.late_records_dropped;
+        stats.checkpoints_written += ws.checkpoints_written;
         // watermarks_advanced is a GLOBAL count (identical across workers on a
         // single broadcast source); report the max rather than a meaningless sum.
         stats.watermarks_advanced = std::max(stats.watermarks_advanced, ws.watermarks_advanced);

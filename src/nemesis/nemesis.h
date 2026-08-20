@@ -110,4 +110,65 @@ struct RealKillResult {
 //    superset-or-equal of the oracle over the full dataset (zero missing).
 RealKillResult RunRealKillNemesis(const RealKillConfig& config);
 
+// ---------------------------------------------------------------------------
+// Partitioned real crash nemesis: fork() + SIGKILL at a TORN global checkpoint
+// ---------------------------------------------------------------------------
+//
+// Extends the real-kill guarantee to the N-worker PartitionedPipeline. The
+// child runs the partitioned engine with per-worker DurableFileSinks and
+// distributed checkpointing; the parent SIGKILLs it at a moment when the global
+// checkpoint is INCONSISTENT — at least one partition has written its file for
+// barrier O_hi but not all have (a torn global checkpoint on disk), while a
+// lower COMPLETE global checkpoint O_lo still exists. Restart, restore, and
+// verify (a) at-least-once holds (union of all workers' pre-crash durable output
+// and post-restore output covers the oracle, 0 missing) and (b) restore fell
+// back to O_lo, never the torn O_hi. A capture-retry loop (mirroring the
+// single-threaded real-kill) forks until a genuine torn-state crash is observed.
+
+struct PartitionedRealKillConfig {
+    uint64_t seed = 42;
+    // SMALL by default: DurableFileSink fsyncs every emit, so a large workload
+    // makes the fork parent wait a long time to reach the target checkpoint.
+    // The invariants under test are scale-free.
+    uint64_t num_records = 6000;
+    uint32_t num_keys = 20;
+    uint32_t num_workers = 4;
+    Duration window_size{1000};
+    Duration max_disorder{500};
+    uint64_t checkpoint_interval = 500;
+    Duration allowed_lateness{0};
+
+    // Arm the kill once a COMPLETE global checkpoint at >= target_checkpoint *
+    // checkpoint_interval exists (a solid fallback), then SIGKILL the instant a
+    // torn (partial, higher) global checkpoint appears on disk.
+    uint32_t target_checkpoint = 2;
+    uint32_t max_attempts = 400;
+};
+
+struct PartitionedRealKillResult {
+    bool passed = false;
+    uint32_t attempts = 0;
+    uint32_t num_workers = 0;
+
+    // Evidence the crash was real and torn.
+    bool killed_by_sigkill = false;      // child terminated by SIGKILL
+    bool final_flush_completed = false;  // child sentinel present (should be false)
+    bool torn_checkpoint_observed = false;  // partial global ckpt on disk at kill
+    uint64_t torn_offset = 0;            // the higher, INCOMPLETE global offset
+    uint64_t restored_offset = 0;        // COMPLETE offset restore fell back to
+
+    // Verification.
+    uint64_t pre_crash_emits = 0;        // durable records across all workers pre-kill
+    uint64_t post_restore_emits = 0;     // durable records across all workers post-restore
+    uint64_t union_results = 0;
+    uint64_t oracle_results = 0;
+    uint64_t missing_results = 0;        // MUST be 0 for at-least-once
+    uint64_t duplicates = 0;
+
+    std::string failure_detail;
+};
+
+PartitionedRealKillResult RunPartitionedRealKillNemesis(
+    const PartitionedRealKillConfig& config);
+
 } // namespace stormglass

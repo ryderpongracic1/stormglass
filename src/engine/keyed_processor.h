@@ -5,9 +5,11 @@
 #include "stream/watermark.h"
 #include "window/state.h"
 #include "window/window.h"
+#include "checkpoint/reader.h"  // CheckpointData (restore)
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace stormglass {
 
@@ -34,21 +36,32 @@ public:
         uint64_t late_records_accepted = 0;
         uint64_t late_records_dropped = 0;
         uint64_t watermarks_advanced = 0;
+        uint64_t checkpoints_written = 0;  // per-partition snapshots taken on barriers
     };
 
+    // checkpoint_dir is this worker's PER-PARTITION checkpoint directory
+    // (<root>/p<k>). When non-empty, dequeuing a kCheckpointBarrier synchronously
+    // snapshots this worker's state into it via the UNCHANGED CheckpointWriter.
+    // Empty (the default) preserves the in-memory-only behavior every existing
+    // caller relies on.
     KeyedProcessor(std::unique_ptr<WindowAssigner> assigner,
                    Sink& sink,
-                   Duration allowed_lateness);
+                   Duration allowed_lateness,
+                   std::string checkpoint_dir = "");
 
     // Apply one data record (window assignment + accumulation).
     void ProcessRecord(const Record& record);
 
-    // Apply one control record. Watermarks drive firing; checkpoint barriers
-    // are a no-op in this phase (broadcast plumbing exists for Phase 3).
+    // Apply one control record. Watermarks drive firing; a checkpoint barrier
+    // snapshots this worker's state to its partition directory (if configured).
     void ProcessControl(const ControlRecord& control);
 
     // Fire every remaining window (mirrors Pipeline::Run's final-flush block).
     void FinalFlush();
+
+    // Seed this worker's state from a per-partition checkpoint before it starts
+    // consuming (mirrors Pipeline::TryRestore: panes + fired windows + watermark).
+    void Restore(const CheckpointData& data);
 
     [[nodiscard]] const Stats& stats() const { return stats_; }
     [[nodiscard]] Timestamp watermark() const { return watermark_.Current(); }
@@ -58,6 +71,7 @@ private:
     Sink& sink_;
     Duration allowed_lateness_;
     bool use_lateness_;
+    std::string checkpoint_dir_;
     WatermarkTracker watermark_;
     KeyedWindowState state_;
     Stats stats_{};

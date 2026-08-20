@@ -99,6 +99,49 @@ std::optional<CheckpointData> CheckpointReader::LoadLatest() {
     return std::nullopt;
 }
 
+std::vector<uint64_t> CheckpointReader::ValidOffsets() {
+    // Deliberately does NOT clean .tmp files: a ".ckpt.tmp" name fails the
+    // ".ckpt" suffix test below anyway, and leaving it untouched keeps this
+    // call side-effect-free so it can poll a directory another process writes.
+    std::vector<uint64_t> offsets;
+    DIR* dir = ::opendir(dir_.c_str());
+    if (!dir) return offsets;
+
+    struct dirent* entry;
+    while ((entry = ::readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name.size() > 5 && name.substr(name.size() - 5) == ".ckpt") {
+            auto data = TryLoad(dir_ + "/" + name);
+            if (data.has_value()) offsets.push_back(data->offset);
+        }
+    }
+    ::closedir(dir);
+    return offsets;
+}
+
+std::optional<CheckpointData> CheckpointReader::LoadOffset(uint64_t offset) {
+    DIR* dir = ::opendir(dir_.c_str());
+    if (!dir) return std::nullopt;
+
+    std::vector<std::string> names;
+    struct dirent* entry;
+    while ((entry = ::readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name.size() > 5 && name.substr(name.size() - 5) == ".ckpt") {
+            names.push_back(std::move(name));
+        }
+    }
+    ::closedir(dir);
+
+    for (const auto& name : names) {
+        auto data = TryLoad(dir_ + "/" + name);
+        if (data.has_value() && data->offset == offset) {
+            return data;
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<CheckpointData> CheckpointReader::TryLoad(const std::string& path) {
     auto data = ReadFile(path);
     if (data.size() < kHeaderSize + kTrailerSize) {

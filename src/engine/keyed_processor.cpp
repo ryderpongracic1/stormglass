@@ -1,14 +1,20 @@
 #include "engine/keyed_processor.h"
 
+#include "checkpoint/writer.h"
+
+#include <utility>
+
 namespace stormglass {
 
 KeyedProcessor::KeyedProcessor(std::unique_ptr<WindowAssigner> assigner,
                                Sink& sink,
-                               Duration allowed_lateness)
+                               Duration allowed_lateness,
+                               std::string checkpoint_dir)
     : assigner_(std::move(assigner)),
       sink_(sink),
       allowed_lateness_(allowed_lateness),
-      use_lateness_(allowed_lateness.count() > 0) {
+      use_lateness_(allowed_lateness.count() > 0),
+      checkpoint_dir_(std::move(checkpoint_dir)) {
     if (use_lateness_) {
         state_.SetAllowedLateness(allowed_lateness_);
     }
@@ -74,9 +80,21 @@ void KeyedProcessor::ProcessControl(const ControlRecord& c) {
             stats_.watermarks_advanced++;
         }
     } else if (c.type == ControlType::kCheckpointBarrier) {
-        // Phase 1: no snapshotting. The barrier is broadcast to every worker
-        // (see PartitionedPipeline::RouterLoop) but workers ignore it here.
-        // Phase 3 (distributed checkpoint) hooks in exactly at this point.
+        // Single-input per-worker snapshot. Records reach this worker in order,
+        // so everything at or below the barrier's absolute offset has been
+        // applied and nothing after it has — no marker buffering needed (each
+        // worker has exactly one input queue). Snapshot this worker's state into
+        // its partition directory with the UNCHANGED CheckpointWriter. Because
+        // the Router broadcasts one absolute offset per barrier, all N workers
+        // snapshot at the SAME offset O; the coordinator (see
+        // distributed_checkpoint.h) treats the N files for O as one global
+        // checkpoint, complete only when all N exist.
+        if (!checkpoint_dir_.empty()) {
+            CheckpointWriter writer(checkpoint_dir_);
+            if (writer.WriteCheckpoint(c.checkpoint_offset, watermark_.Current(), state_)) {
+                stats_.checkpoints_written++;
+            }
+        }
     }
 }
 
@@ -109,6 +127,18 @@ void KeyedProcessor::FinalFlush() {
         }
     }
     sink_.Flush();
+}
+
+// Mirrors Pipeline::TryRestore: seed panes, the persisted fired-window set
+// (v2 checkpoints), and the watermark before the worker starts consuming.
+void KeyedProcessor::Restore(const CheckpointData& data) {
+    for (const auto& entry : data.panes) {
+        state_.RestorePane(entry.key, entry.window, entry.sum, entry.count);
+    }
+    if (!data.fired_windows.empty()) {
+        state_.RestoreFiredWindows(data.fired_windows);
+    }
+    watermark_.Advance(data.watermark);
 }
 
 } // namespace stormglass

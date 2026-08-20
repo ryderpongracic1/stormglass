@@ -1,5 +1,7 @@
 #include "nemesis/nemesis.h"
 #include "engine/pipeline.h"
+#include "engine/partitioned_pipeline.h"
+#include "checkpoint/distributed_checkpoint.h"
 #include "source/generator.h"
 #include "source/stopping_source.h"
 #include "sink/memory_sink.h"
@@ -534,6 +536,273 @@ RealKillResult RunRealKillNemesis(const RealKillConfig& config) {
     }
 
     result.passed = (result.missing_results == 0);
+
+    RemoveDir(workdir);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Partitioned real crash nemesis: fork() a child running PartitionedPipeline
+// with per-worker durable sinks + distributed checkpointing, SIGKILL it at a
+// torn global-checkpoint state, restore, and verify at-least-once + complete
+// fallback.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+GeneratorConfig MakePartGenConfig(const PartitionedRealKillConfig& config) {
+    return GeneratorConfig{
+        .seed = config.seed,
+        .num_keys = config.num_keys,
+        .num_records = config.num_records,
+        .max_disorder = config.max_disorder,
+        .batch_size = 1024,
+        .watermark_interval = 100,
+        .checkpoint_interval = config.checkpoint_interval,
+    };
+}
+
+std::function<std::unique_ptr<Sink>(uint32_t)> MakeDurableFactory(
+    const std::string& prefix) {
+    return [prefix](uint32_t k) -> std::unique_ptr<Sink> {
+        return std::make_unique<DurableFileSink>(prefix + std::to_string(k) + ".bin");
+    };
+}
+
+// Runs the partitioned pipeline to completion in the forked child. Reached only
+// if the parent fails to kill it in time — it then records a sentinel proving
+// the drain (and final flush) completed, so the parent rejects the attempt.
+void RunPartitionedRealKillChild(const PartitionedRealKillConfig& config,
+                                 const std::string& ckpt_root,
+                                 const std::string& sink_prefix,
+                                 const std::string& sentinel_path) {
+    PartitionedPipelineConfig pconfig{};
+    pconfig.num_workers = config.num_workers;
+    pconfig.allowed_lateness = config.allowed_lateness;
+    pconfig.checkpoint_dir = ckpt_root;
+    pconfig.worker_sink_factory = MakeDurableFactory(sink_prefix);
+
+    const Duration window_size = config.window_size;
+    PartitionedPipeline pipeline(
+        std::make_unique<DeterministicGenerator>(MakePartGenConfig(config)),
+        [window_size] { return std::make_unique<TumblingAssigner>(window_size); },
+        std::make_unique<MemorySink>(),  // caller sink unused (workers self-persist)
+        pconfig);
+    pipeline.Run();  // includes final flush of every worker's in-memory windows
+
+    int fd = ::open(sentinel_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        const char done = 'D';
+        [[maybe_unused]] auto n = ::write(fd, &done, 1);
+        ::fsync(fd);
+        ::close(fd);
+    }
+}
+
+} // namespace
+
+PartitionedRealKillResult RunPartitionedRealKillNemesis(
+    const PartitionedRealKillConfig& config) {
+    PartitionedRealKillResult result;
+    result.num_workers = config.num_workers;
+    const uint32_t n = std::max<uint32_t>(1, config.num_workers);
+    const uint64_t arm_offset =
+        static_cast<uint64_t>(config.target_checkpoint) * config.checkpoint_interval;
+
+    std::string workdir, ckpt_root, sink_pre, sink_post, sentinel;
+    bool captured = false;
+    uint64_t captured_complete = 0, captured_torn = 0;
+
+    for (uint32_t attempt = 1; attempt <= config.max_attempts; ++attempt) {
+        result.attempts = attempt;
+
+        workdir = CreateTempDir();
+        if (workdir.empty()) {
+            result.failure_detail = "Failed to create temp dir";
+            return result;
+        }
+        ckpt_root = workdir + "/ckpt";
+        std::filesystem::create_directory(ckpt_root);
+        sink_pre = workdir + "/pre-p";
+        sink_post = workdir + "/post-p";
+        sentinel = workdir + "/done";
+
+        pid_t pid = ::fork();
+        if (pid < 0) {
+            RemoveDir(workdir);
+            result.failure_detail = "fork() failed";
+            return result;
+        }
+        if (pid == 0) {
+            RunPartitionedRealKillChild(config, ckpt_root, sink_pre, sentinel);
+            ::_exit(0);
+        }
+
+        // Parent: arm once a complete global checkpoint deep enough exists, then
+        // SIGKILL the instant a torn (higher, incomplete) global checkpoint is
+        // on disk — some partition wrote O_hi but not all have.
+        bool killed = false, child_reaped = false, armed = false;
+        int status = 0;
+        while (true) {
+            pid_t w = ::waitpid(pid, &status, WNOHANG);
+            if (w == pid) { child_reaped = true; break; }
+
+            auto complete = HighestCompleteCheckpoint(ckpt_root, n);
+            if (!armed) {
+                if (complete && *complete >= arm_offset) armed = true;
+                else { SleepMicros(50); continue; }
+            }
+            auto partial = HighestPartialCheckpoint(ckpt_root, n);
+            if (complete && partial && *partial > *complete) {
+                ::kill(pid, SIGKILL);
+                killed = true;
+                break;
+            }
+        }
+
+        if (!child_reaped) {
+            ::waitpid(pid, &status, 0);
+        }
+
+        // Re-evaluate on the PERSISTED disk (a renamed file survives SIGKILL).
+        auto complete = HighestCompleteCheckpoint(ckpt_root, n);
+        auto partial = HighestPartialCheckpoint(ckpt_root, n);
+        bool by_sigkill = killed && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+        bool sentinel_present = PathExists(sentinel);
+        bool torn = complete.has_value() && partial.has_value() && *partial > *complete;
+
+        bool genuine = by_sigkill && !sentinel_present && torn;
+        if (!genuine) {
+            RemoveDir(workdir);
+            continue;
+        }
+
+        result.killed_by_sigkill = by_sigkill;
+        result.final_flush_completed = sentinel_present;
+        result.torn_checkpoint_observed = torn;
+        captured_complete = *complete;
+        captured_torn = *partial;
+        result.torn_offset = captured_torn;
+        captured = true;
+        break;
+    }
+
+    if (!captured) {
+        result.failure_detail =
+            "Could not capture a genuine torn-state crash within max_attempts";
+        if (!workdir.empty()) RemoveDir(workdir);
+        return result;
+    }
+
+    // --- Restart: fresh partitioned pipeline restores from the highest COMPLETE
+    //     global checkpoint (discarding the torn O_hi) and drains to completion
+    //     into a second set of per-worker durable sinks. ---
+    {
+        PartitionedPipelineConfig pconfig{};
+        pconfig.num_workers = n;
+        pconfig.allowed_lateness = config.allowed_lateness;
+        pconfig.checkpoint_dir = ckpt_root;
+        pconfig.worker_sink_factory = MakeDurableFactory(sink_post);
+
+        const Duration window_size = config.window_size;
+        PartitionedPipeline pipeline(
+            std::make_unique<DeterministicGenerator>(MakePartGenConfig(config)),
+            [window_size] { return std::make_unique<TumblingAssigner>(window_size); },
+            std::make_unique<MemorySink>(),
+            pconfig);
+        auto stats = pipeline.Run();
+        result.restored_offset = stats.records_replayed;
+    }
+
+    // Restore MUST have used the complete offset, never the torn one.
+    if (result.restored_offset != captured_complete) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "restore used offset %lu, expected complete offset %lu (torn=%lu)",
+            result.restored_offset, captured_complete, captured_torn);
+        result.failure_detail = buf;
+    }
+    if (result.restored_offset >= captured_torn) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "restore offset %lu did not fall back below torn offset %lu",
+            result.restored_offset, captured_torn);
+        if (result.failure_detail.empty()) result.failure_detail = buf;
+    }
+
+    // --- Union durable pre-crash + post-restore output across ALL workers ---
+    ResultMap combined;
+    auto absorb = [&combined](const std::vector<WindowResult>& results) {
+        for (const auto& r : results) {
+            ResultKey rk{r.key, r.window.start.time_since_epoch().count(),
+                         r.window.end.time_since_epoch().count()};
+            combined[rk] = ResultValue{r.result.value, r.result.count};
+        }
+    };
+    uint64_t pre_total = 0, post_total = 0;
+    for (uint32_t k = 0; k < n; ++k) {
+        auto pre = DurableFileSink::ReadAll(sink_pre + std::to_string(k) + ".bin");
+        auto post = DurableFileSink::ReadAll(sink_post + std::to_string(k) + ".bin");
+        pre_total += pre.size();
+        post_total += post.size();
+        absorb(pre);
+        absorb(post);
+    }
+    result.pre_crash_emits = pre_total;
+    result.post_restore_emits = post_total;
+    result.union_results = combined.size();
+    result.duplicates = (pre_total + post_total) - combined.size();
+
+    // --- Oracle over the full dataset (fed identically to the single-threaded
+    //     real-kill) ---
+    Oracle oracle(OracleConfig{.window_size = config.window_size,
+                               .allowed_lateness = config.allowed_lateness});
+    DeterministicGenerator oracle_gen(MakePartGenConfig(config));
+    while (auto batch = oracle_gen.Next()) {
+        for (auto& item : batch->items) {
+            if (auto* r = std::get_if<Record>(&item)) {
+                oracle.AddRecord(*r);
+            } else if (auto* c = std::get_if<ControlRecord>(&item)) {
+                if (c->type == ControlType::kWatermark) {
+                    oracle.AdvanceWatermark(c->watermark);
+                }
+            }
+        }
+    }
+    auto oracle_results = oracle.ComputeResults();
+    result.oracle_results = oracle_results.size();
+
+    result.missing_results = 0;
+    for (const auto& r : oracle_results) {
+        ResultKey rk{r.key, r.window.start.time_since_epoch().count(),
+                     r.window.end.time_since_epoch().count()};
+        auto it = combined.find(rk);
+        if (it == combined.end()) {
+            result.missing_results++;
+            if (result.failure_detail.empty()) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "Missing result: key=%s window=[%ld,%ld)",
+                    r.key.c_str(), rk.window_start, rk.window_end);
+                result.failure_detail = buf;
+            }
+        } else if (it->second.sum != r.result.value ||
+                   it->second.count != r.result.count) {
+            result.missing_results++;
+            if (result.failure_detail.empty()) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "Value mismatch key=%s window=[%ld,%ld): "
+                    "oracle sum=%ld count=%lu, got sum=%ld count=%lu",
+                    r.key.c_str(), rk.window_start, rk.window_end,
+                    r.result.value, r.result.count,
+                    it->second.sum, it->second.count);
+                result.failure_detail = buf;
+            }
+        }
+    }
+
+    result.passed = (result.missing_results == 0) && result.failure_detail.empty();
 
     RemoveDir(workdir);
     return result;

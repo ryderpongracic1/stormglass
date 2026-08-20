@@ -16,6 +16,8 @@ void PrintUsage() {
         "  --checkpoint-interval N  (default: 5000)\n"
         "  --phase <mid-checkpoint|mid-emission|between>  in-process phase (default: between)\n"
         "  --real-kill            Headline mode: genuine fork() + SIGKILL crash\n"
+        "  --partitioned          Partitioned engine: fork+SIGKILL at a TORN global checkpoint\n"
+        "  --workers N            Worker count for --partitioned (default: 4)\n"
         "  --real-phase <between|mid-checkpoint>  real-kill point (default: between)\n"
         "  --keys N               Keys per run, real-kill only (default: 50)\n"
         "  --disorder-profile <bounded|heavy-tailed>  real-kill (default: bounded)\n"
@@ -135,6 +137,62 @@ int RunRealKill(uint64_t num_seeds, uint64_t num_records, uint64_t checkpoint_in
     return (passed == num_seeds && total_missing == 0) ? 0 : 1;
 }
 
+int RunPartitionedRealKill(uint64_t num_seeds, uint64_t num_records,
+                           uint64_t checkpoint_interval, uint32_t num_keys,
+                           uint32_t num_workers, bool verbose) {
+    std::printf("Nemesis test (PARTITIONED fork+SIGKILL at torn global checkpoint): "
+                "%" PRIu64 " runs, %u workers\n", num_seeds, num_workers);
+
+    uint64_t passed = 0, total_missing = 0, total_duplicates = 0;
+    uint64_t kills = 0, torns = 0, clean_flushes = 0;
+
+    for (uint64_t i = 0; i < num_seeds; ++i) {
+        PartitionedRealKillConfig config{};
+        config.seed = 42 + i;
+        config.num_records = num_records;
+        config.num_keys = num_keys;
+        config.num_workers = num_workers;
+        config.checkpoint_interval = checkpoint_interval;
+        config.target_checkpoint = 2;
+
+        auto result = RunPartitionedRealKillNemesis(config);
+
+        if (result.passed) ++passed;
+        if (result.killed_by_sigkill) ++kills;
+        if (result.torn_checkpoint_observed) ++torns;
+        if (result.final_flush_completed) ++clean_flushes;
+        total_missing += result.missing_results;
+        total_duplicates += result.duplicates;
+
+        if (verbose) {
+            std::printf("  [run %" PRIu64 "/%" PRIu64 "] %s killed=%s flush=%s torn=%s "
+                        "restored@%" PRIu64 " torn@%" PRIu64 " pre=%" PRIu64 " post=%" PRIu64 " "
+                        "union=%" PRIu64 " oracle=%" PRIu64 " missing=%" PRIu64 " dup=%" PRIu64 " attempts=%u",
+                        i + 1, num_seeds, result.passed ? "PASS" : "FAIL",
+                        result.killed_by_sigkill ? "SIGKILL" : "no",
+                        result.final_flush_completed ? "yes" : "no",
+                        result.torn_checkpoint_observed ? "yes" : "no",
+                        result.restored_offset, result.torn_offset,
+                        result.pre_crash_emits, result.post_restore_emits,
+                        result.union_results, result.oracle_results,
+                        result.missing_results, result.duplicates, result.attempts);
+            if (!result.passed && !result.failure_detail.empty()) {
+                std::printf(" — %s", result.failure_detail.c_str());
+            }
+            std::printf("\n");
+        }
+    }
+
+    std::printf("\nResult: %" PRIu64 "/%" PRIu64 " passed, %" PRIu64 " missing across all runs\n",
+                passed, num_seeds, total_missing);
+    std::printf("Kill evidence: %" PRIu64 "/%" PRIu64 " SIGKILL, %" PRIu64 " torn global checkpoints "
+                "captured, %" PRIu64 " clean-flush escapes\n",
+                kills, num_seeds, torns, clean_flushes);
+    std::printf("Total duplicates: %" PRIu64 " (at-least-once across all workers)\n",
+                total_duplicates);
+    return (passed == num_seeds && total_missing == 0) ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -148,6 +206,8 @@ int main(int argc, char* argv[]) {
     bool verbose = false;
     bool records_set = false;
     bool interval_set = false;
+    bool partitioned = false;
+    uint32_t num_workers = 4;
     DisorderMode disorder_mode = DisorderMode::kBounded;
     double late_fraction = 0.0;
     uint64_t late_tail_ms = 0;
@@ -178,6 +238,10 @@ int main(int argc, char* argv[]) {
             }
         } else if (std::strcmp(argv[i], "--real-kill") == 0) {
             real_kill = true;
+        } else if (std::strcmp(argv[i], "--partitioned") == 0) {
+            partitioned = true;
+        } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
+            num_workers = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--real-phase") == 0 && i + 1 < argc) {
             ++i;
             if (std::strcmp(argv[i], "between") == 0) {
@@ -214,6 +278,15 @@ int main(int argc, char* argv[]) {
             PrintUsage();
             return 1;
         }
+    }
+
+    if (partitioned) {
+        // Partitioned real-kill defaults: small workload (per-emit fsync),
+        // frequent catchable checkpoints.
+        if (!records_set) num_records = 6000;
+        if (!interval_set) checkpoint_interval = 500;
+        return RunPartitionedRealKill(num_seeds, num_records, checkpoint_interval,
+                                      num_keys, num_workers, verbose);
     }
 
     if (real_kill) {
