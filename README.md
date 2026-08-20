@@ -54,7 +54,7 @@ Nemesis stops the pipeline at targeted record counts (between checkpoints, at ch
 ## Reproduce
 
 ```bash
-make build && make test              # 105 tests, Debug+ASan
+make build && make test              # 105 tests, Debug (+ASan where the runtime is available)
 make bench                           # Release throughput numbers
 ./build-release/app/stormglass_oracle --seeds 100 --records 10000
 ./build-release/app/stormglass_nemesis --seeds 20 --verbose
