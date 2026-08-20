@@ -11,6 +11,7 @@
 #include "window/tumbling.h"
 #include "oracle/oracle.h"
 #include <map>
+#include <tuple>
 
 #include <cstdlib>
 #include <dirent.h>
@@ -260,13 +261,18 @@ TEST_F(CheckpointTest, RestoreIntoState) {
     }
 
     // Verify restored state matches original
-    EXPECT_EQ(restored.Panes().size(), state.Panes().size());
-    for (const auto& [kw, pane] : state.Panes()) {
-        auto it = restored.Panes().find(kw);
-        ASSERT_NE(it, restored.Panes().end());
-        EXPECT_EQ(it->second.sum, pane.sum);
-        EXPECT_EQ(it->second.count, pane.count);
-    }
+    EXPECT_EQ(restored.TotalPanes(), state.TotalPanes());
+
+    auto pane_map = [](const KeyedWindowState& s) {
+        std::map<std::tuple<std::string, int64_t, int64_t>,
+                 std::pair<int64_t, uint64_t>> m;
+        s.ForEachPane([&](const std::string& key, const Window& w, const Pane& pane) {
+            m[{key, w.start.time_since_epoch().count(),
+               w.end.time_since_epoch().count()}] = {pane.sum, pane.count};
+        });
+        return m;
+    };
+    EXPECT_EQ(pane_map(restored), pane_map(state));
 }
 
 TEST_F(CheckpointTest, RestoreWithLatenessRefiresBehavior) {
@@ -282,6 +288,7 @@ TEST_F(CheckpointTest, RestoreWithLatenessRefiresBehavior) {
     gen_config.max_disorder = Duration{500};
     gen_config.batch_size = 256;
     gen_config.watermark_interval = 50;
+    gen_config.checkpoint_interval = 5000;
     
     PipelineConfig pipe_config;
     pipe_config.checkpoint_dir = dir_;

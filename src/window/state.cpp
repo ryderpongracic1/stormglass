@@ -1,8 +1,5 @@
 #include "window/state.h"
 
-#include <algorithm>
-#include <unordered_set>
-
 namespace stormglass {
 
 void KeyedWindowState::SetAllowedLateness(Duration lateness) {
@@ -10,7 +7,7 @@ void KeyedWindowState::SetAllowedLateness(Duration lateness) {
 }
 
 void KeyedWindowState::Add(const std::string& key, const Window& window, int64_t value) {
-    panes_[KeyWindow{key, window}].Add(value);
+    windows_[window][key].Add(value);
 }
 
 bool KeyedWindowState::AddWithLateness(const std::string& key, const Window& window,
@@ -21,54 +18,51 @@ bool KeyedWindowState::AddWithLateness(const std::string& key, const Window& win
         return false;
     }
 
-    // If the window hasn't been fired yet, accept normally
-    if (!fired_windows_.count(window)) {
-        panes_[KeyWindow{key, window}].Add(value);
-        return true;
-    }
+    windows_[window][key].Add(value);
 
-    // Window has been fired but within lateness — accept late record, mark for re-fire
-    panes_[KeyWindow{key, window}].Add(value);
-    refired_windows_.insert(window);
+    // Window already fired but still within lateness — mark for re-fire.
+    if (fired_windows_.count(window)) {
+        refired_windows_.insert(window);
+    }
     return true;
 }
 
 std::vector<Window> KeyedWindowState::ExpiredWindows(Timestamp watermark) const {
-    std::unordered_set<Window, WindowHash> expired;
-    for (const auto& [kw, pane] : panes_) {
-        if (kw.window.end <= watermark && !fired_windows_.count(kw.window)) {
-            expired.insert(kw.window);
+    // windows_ is ordered by window-end, so every expired window is a prefix.
+    // Walk that prefix and stop at the first window whose end is beyond the
+    // watermark — cost is proportional to expiring windows, not to live panes.
+    std::vector<Window> expired;
+    for (const auto& [window, panes] : windows_) {
+        if (window.end > watermark) break;
+        if (!fired_windows_.count(window)) {
+            expired.push_back(window);
         }
     }
-    return {expired.begin(), expired.end()};
+    return expired;
 }
 
 std::vector<WindowResult> KeyedWindowState::FireWindow(const Window& window) {
     std::vector<WindowResult> results;
 
-    for (const auto& [kw, pane] : panes_) {
-        if (kw.window == window) {
-            results.push_back(WindowResult{
-                .key = kw.key,
-                .window = window,
-                .result = AggregateResult{.value = pane.sum, .count = pane.count},
-            });
-        }
+    auto it = windows_.find(window);
+    if (it == windows_.end()) {
+        return results;
     }
 
-    // If no allowed lateness, erase panes immediately (original behavior)
+    results.reserve(it->second.size());
+    for (const auto& [key, pane] : it->second) {
+        results.push_back(WindowResult{
+            .key = key,
+            .window = window,
+            .result = AggregateResult{.value = pane.sum, .count = pane.count},
+        });
+    }
+
     if (allowed_lateness_.count() == 0) {
-        std::vector<KeyWindow> to_erase;
-        for (const auto& [kw, pane] : panes_) {
-            if (kw.window == window) {
-                to_erase.push_back(kw);
-            }
-        }
-        for (const auto& kw : to_erase) {
-            panes_.erase(kw);
-        }
+        // No lateness: erase the window's panes immediately (original behavior).
+        windows_.erase(it);
     } else {
-        // Mark as fired but keep panes alive for late data
+        // Keep panes alive for late data; mark the window fired.
         fired_windows_.insert(window);
     }
 
@@ -88,17 +82,7 @@ std::vector<Window> KeyedWindowState::GarbageCollectableWindows(Timestamp waterm
 
 void KeyedWindowState::GarbageCollect(const std::vector<Window>& windows) {
     for (const auto& w : windows) {
-        // Remove all panes for this window
-        std::vector<KeyWindow> to_erase;
-        for (const auto& [kw, pane] : panes_) {
-            if (kw.window == w) {
-                to_erase.push_back(kw);
-            }
-        }
-        for (const auto& kw : to_erase) {
-            panes_.erase(kw);
-        }
-        // Remove from tracking sets
+        windows_.erase(w);
         fired_windows_.erase(w);
         refired_windows_.erase(w);
     }
@@ -117,16 +101,25 @@ bool KeyedWindowState::IsFired(const Window& window) const {
 }
 
 std::vector<Window> KeyedWindowState::AllWindows() const {
-    std::unordered_set<Window, WindowHash> windows;
-    for (const auto& [kw, pane] : panes_) {
-        windows.insert(kw.window);
+    std::vector<Window> windows;
+    windows.reserve(windows_.size());
+    for (const auto& [window, panes] : windows_) {
+        windows.push_back(window);
     }
-    return {windows.begin(), windows.end()};
+    return windows;
+}
+
+size_t KeyedWindowState::TotalPanes() const {
+    size_t total = 0;
+    for (const auto& [window, panes] : windows_) {
+        total += panes.size();
+    }
+    return total;
 }
 
 void KeyedWindowState::RestorePane(const std::string& key, const Window& window,
                                     int64_t sum, uint64_t count) {
-    auto& pane = panes_[KeyWindow{key, window}];
+    auto& pane = windows_[window][key];
     pane.sum = sum;
     pane.count = count;
 }

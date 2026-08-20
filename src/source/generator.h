@@ -26,6 +26,11 @@ struct GeneratorConfig {
     uint32_t batch_size = 1024;
     uint32_t watermark_interval = 100;
 
+    // Records between emitted checkpoint barriers (0 = no barriers).
+    // The source stamps each barrier with the absolute source offset, and the
+    // pipeline snapshots when it dequeues one — see ControlType::kCheckpointBarrier.
+    uint64_t checkpoint_interval = 0;
+
     // Heavy-tailed disorder controls (ignored when disorder_mode == kBounded).
     DisorderMode disorder_mode = DisorderMode::kBounded;
     double late_fraction = 0.0;   // P(record is a heavy-tail late record), [0, 1]
@@ -47,6 +52,7 @@ private:
     std::mt19937_64 rng_;
     uint64_t offset_ = 0;
     uint64_t records_since_watermark_ = 0;
+    uint64_t records_since_checkpoint_ = 0;
     Timestamp max_event_time_seen_{Timestamp::min()};
 };
 

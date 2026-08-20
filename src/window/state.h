@@ -3,6 +3,7 @@
 #include "window/window.h"
 #include "sink/sink.h"
 
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,6 +31,22 @@ struct Pane {
     void Add(int64_t v) { sum += v; ++count; }
 };
 
+// Orders windows by end (then start) so that "all windows expired by watermark"
+// is a prefix of the ordered structure — a bounded walk instead of a full scan.
+struct WindowByEnd {
+    bool operator()(const Window& a, const Window& b) const {
+        if (a.end != b.end) return a.end < b.end;
+        return a.start < b.start;
+    }
+};
+
+// Keyed window state stored as Window -> { key -> Pane }, keyed on window-end.
+//
+// This is the Flink-style layout: watermark-driven work touches only the
+// windows that actually expire (a prefix of the ordered map) and firing a
+// window touches only that window's inner key map. The cost of a watermark
+// advance is therefore proportional to the windows expiring, not to the number
+// of live panes (keys) in the system.
 class KeyedWindowState {
 public:
     // Existing interface (unchanged behavior when allowed_lateness == 0)
@@ -59,9 +76,18 @@ public:
     // Check if a window has already been fired
     [[nodiscard]] bool IsFired(const Window& window) const;
 
-    // For checkpoint serialization: read-only access to all panes
-    [[nodiscard]] const std::unordered_map<KeyWindow, Pane, KeyWindowHash>& Panes() const {
-        return panes_;
+    // For checkpoint serialization: total number of (key, window) panes.
+    [[nodiscard]] size_t TotalPanes() const;
+
+    // For checkpoint serialization: visit every pane as fn(key, window, pane).
+    // Iteration order is unspecified; the checkpoint format does not depend on it.
+    template <typename Fn>
+    void ForEachPane(Fn&& fn) const {
+        for (const auto& [window, panes] : windows_) {
+            for (const auto& [key, pane] : panes) {
+                fn(key, window, pane);
+            }
+        }
     }
 
     // For checkpoint serialization: read-only access to fired windows
@@ -80,7 +106,8 @@ public:
     }
 
 private:
-    std::unordered_map<KeyWindow, Pane, KeyWindowHash> panes_;
+    using PaneMap = std::unordered_map<std::string, Pane>;
+    std::map<Window, PaneMap, WindowByEnd> windows_;
     Duration allowed_lateness_{0};
     std::unordered_set<Window, WindowHash> fired_windows_;
     std::unordered_set<Window, WindowHash> refired_windows_;

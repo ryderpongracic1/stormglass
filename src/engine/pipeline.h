@@ -55,7 +55,6 @@ private:
     void TryRestore();
     void WriteCheckpoint(uint64_t offset, Stats& stats);
 
-    uint64_t records_since_checkpoint_ = 0;
     uint64_t restored_offset_ = 0;
 };
 

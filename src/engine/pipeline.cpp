@@ -91,19 +91,6 @@ Pipeline::Stats Pipeline::Run() {
                     if (any_dropped) stats.late_records_dropped++;
                     if (any_late_accepted) stats.late_records_accepted++;
                     stats.records_processed++;
-
-                    // Checkpoint trigger based on record count
-                    if (checkpointing_enabled()) {
-                        records_since_checkpoint_++;
-                        if (records_since_checkpoint_ >= config_.checkpoint_interval) {
-                            records_since_checkpoint_ = 0;
-                            // Checkpoint offset must be ABSOLUTE: restored_offset_
-                            // (records covered by the checkpoint we restored from, if any)
-                            // plus records processed in this run. Using a relative offset
-                            // here caused data loss on a second crash (see DoubleCrashRestore).
-                            WriteCheckpoint(restored_offset_ + stats.records_processed, stats);
-                        }
-                    }
                 },
                 [&](const ControlRecord& c) {
                     if (c.type == ControlType::kWatermark) {
@@ -132,6 +119,15 @@ Pipeline::Stats Pipeline::Run() {
                             }
 
                             stats.watermarks_advanced++;
+                        }
+                    } else if (c.type == ControlType::kCheckpointBarrier) {
+                        // Records are processed in order, so everything at or
+                        // below the barrier's absolute offset has been applied
+                        // and nothing after it has. Snapshot (state + that
+                        // absolute offset + current watermark) synchronously —
+                        // the degenerate single-path Chandy-Lamport barrier.
+                        if (checkpointing_enabled()) {
+                            WriteCheckpoint(c.checkpoint_offset, stats);
                         }
                     }
                 }

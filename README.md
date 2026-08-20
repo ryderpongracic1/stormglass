@@ -13,20 +13,21 @@ Single-process event-time stream processor. Tumbling and sliding windows, bounde
 ## Architecture
 
 ```
-Source → [Watermark] → Keyed Window Operator → Sink
-                              ↓
-                    Checkpoint Barrier → Atomic Snapshot
+Source → [Watermark | Checkpoint Barrier] → Keyed Window Operator → Sink
+                                                    ↓
+                            barrier ⇒ Atomic Snapshot (state + offset)
 ```
 
 - Records flow as contiguous batches through a single pipeline loop
 - Watermark = max_event_time − disorder_bound, injected in-band as control records
-- Window operator partitions by key, assigns to time windows, fires on watermark advance
-- Checkpoint = atomic snapshot of (window state + source offset) via fsync + rename — structurally impossible state/offset mismatch
+- Checkpoint barrier is injected in-band by the source at the checkpoint interval, stamped with the absolute source offset
+- Window operator partitions by key into a per-window `key → pane` map ordered by window-end, so a watermark advance touches only the windows that expire — not every live pane
+- Checkpoint = atomic snapshot of (window state + the barrier's absolute offset + watermark) via fsync + rename, taken when the operator dequeues the barrier — structurally impossible state/offset mismatch
 
 ## Key design decisions
 
 1. **Snapshot checkpoint, not delta-WAL** — window state is bounded and self-expiring; the source is the replay log
-2. **Degenerate Chandy-Lamport barrier** — single pipeline path makes the barrier trivial; extends to multi-input in v2 without rewrite
+2. **Real in-band Chandy-Lamport barrier** — the source emits a checkpoint-barrier control record stamped with the absolute source offset; the operator snapshots when it dequeues it. In-order processing on a single path means everything ≤ the barrier offset is applied and nothing after it is (the degenerate, single-input case); extends to multi-input alignment in v2 without rewrite
 3. **SIMD aggregation kernels** — explicit AVX2/SSE4.2 intrinsics for contiguous int64 spans, measured speedup varies 1.1–3.2× on shared infra (median ~1.5×)
 4. **Bounded out-of-orderness watermarks** — wm = max_event_time − disorder bound; in-band as control records
 5. **Single-threaded by design** — eliminates data races; concurrency is v2's problem
@@ -54,7 +55,7 @@ Nemesis stops the pipeline at targeted record counts (between checkpoints, at ch
 ## Reproduce
 
 ```bash
-make build && make test              # 105 tests, Debug (+ASan where the runtime is available)
+make build && make test              # 122 tests, Debug (+ASan where the runtime is available)
 make bench                           # Release throughput numbers
 ./build-release/app/stormglass_oracle --seeds 100 --records 10000
 ./build-release/app/stormglass_nemesis --seeds 20 --verbose

@@ -104,6 +104,7 @@ GeneratorConfig MakeGenConfig(const NemesisConfig& config) {
         .max_disorder = config.max_disorder,
         .batch_size = 1024,
         .watermark_interval = 100,
+        .checkpoint_interval = config.checkpoint_interval,
     };
 }
 
@@ -296,6 +297,7 @@ GeneratorConfig MakeRealGenConfig(const RealKillConfig& config) {
         .max_disorder = config.max_disorder,
         .batch_size = 1024,
         .watermark_interval = 100,
+        .checkpoint_interval = config.checkpoint_interval,
     };
 }
 

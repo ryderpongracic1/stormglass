@@ -96,20 +96,19 @@ bool CheckpointWriter::WriteCheckpoint(uint64_t offset, Timestamp watermark,
     AppendLE64(payload, offset);
     AppendSLE64(payload, watermark.time_since_epoch().count());
 
-    const auto& panes = state.Panes();
-    uint64_t num_entries = panes.size();
+    const uint64_t num_entries = state.TotalPanes();
     AppendLE64(payload, num_entries);
 
-    // Body: iterate panes
-    for (const auto& [kw, pane] : panes) {
-        uint32_t key_len = static_cast<uint32_t>(kw.key.size());
+    // Body: iterate panes (order unspecified; the reader reconstructs a map)
+    state.ForEachPane([&](const std::string& key, const Window& window, const Pane& pane) {
+        uint32_t key_len = static_cast<uint32_t>(key.size());
         AppendLE32(payload, key_len);
-        payload.insert(payload.end(), kw.key.begin(), kw.key.end());
-        AppendSLE64(payload, kw.window.start.time_since_epoch().count());
-        AppendSLE64(payload, kw.window.end.time_since_epoch().count());
+        payload.insert(payload.end(), key.begin(), key.end());
+        AppendSLE64(payload, window.start.time_since_epoch().count());
+        AppendSLE64(payload, window.end.time_since_epoch().count());
         AppendSLE64(payload, pane.sum);
         AppendLE64(payload, pane.count);
-    }
+    });
 
     // Fired windows section (version 2+)
     const auto& fired = state.FiredWindows();

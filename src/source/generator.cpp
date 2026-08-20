@@ -71,7 +71,11 @@ std::optional<Batch> DeterministicGenerator::Next() {
         static_cast<uint64_t>(config_.batch_size),
         config_.num_records - offset_);
 
-    batch.items.reserve(records_this_batch + records_this_batch / config_.watermark_interval + 1);
+    uint64_t wm_estimate = records_this_batch / config_.watermark_interval + 1;
+    uint64_t ckpt_estimate = config_.checkpoint_interval > 0
+                                 ? records_this_batch / config_.checkpoint_interval + 1
+                                 : 0;
+    batch.items.reserve(records_this_batch + wm_estimate + ckpt_estimate);
 
     for (uint64_t i = 0; i < records_this_batch; ++i) {
         batch.items.emplace_back(GenerateRecord());
@@ -91,6 +95,23 @@ std::optional<Batch> DeterministicGenerator::Next() {
                 .checkpoint_offset = offset_,
             });
         }
+
+        // Inject checkpoint barrier at interval, stamped with the ABSOLUTE
+        // source offset. Because records are processed in order, everything at
+        // or below this offset has been applied when the pipeline dequeues the
+        // barrier and nothing after it has — the degenerate Chandy-Lamport
+        // property. The barrier draws no rng, so Seek() replay stays stable.
+        if (config_.checkpoint_interval > 0) {
+            ++records_since_checkpoint_;
+            if (records_since_checkpoint_ >= config_.checkpoint_interval) {
+                records_since_checkpoint_ = 0;
+                batch.items.emplace_back(ControlRecord{
+                    .type = ControlType::kCheckpointBarrier,
+                    .watermark = Timestamp::min(),
+                    .checkpoint_offset = offset_,
+                });
+            }
+        }
     }
 
     return batch;
@@ -101,15 +122,24 @@ void DeterministicGenerator::Seek(uint64_t offset) {
     rng_.seed(config_.seed);
     offset_ = 0;
     records_since_watermark_ = 0;
+    records_since_checkpoint_ = 0;
     max_event_time_seen_ = Timestamp::min();
 
-    // Replay generation to reach target offset
+    // Replay generation to reach target offset, mirroring the watermark and
+    // checkpoint counters so post-seek control records land at the same
+    // absolute offsets a non-seeked run would produce.
     while (offset_ < offset) {
         GenerateRecord();
         ++offset_;
         ++records_since_watermark_;
         if (records_since_watermark_ >= config_.watermark_interval) {
             records_since_watermark_ = 0;
+        }
+        if (config_.checkpoint_interval > 0) {
+            ++records_since_checkpoint_;
+            if (records_since_checkpoint_ >= config_.checkpoint_interval) {
+                records_since_checkpoint_ = 0;
+            }
         }
     }
 }

@@ -74,7 +74,8 @@ TEST(NemesisTest, CheckpointDoesNotAlterSemantics) {
 
         auto gen = std::make_unique<DeterministicGenerator>(GeneratorConfig{
             .seed = 42, .num_keys = 10, .num_records = 5000,
-            .max_disorder = Duration{500}, .batch_size = 1024, .watermark_interval = 100});
+            .max_disorder = Duration{500}, .batch_size = 1024, .watermark_interval = 100,
+            .checkpoint_interval = 500});
         auto assigner = std::make_unique<TumblingAssigner>(Duration{1000});
         PipelineConfig config{};
         config.checkpoint_dir = ckpt_dir;
@@ -158,6 +159,7 @@ TEST(Nemesis, DoubleCrashRestore) {
     gen_config.max_disorder = Duration{500};
     gen_config.batch_size = 256;
     gen_config.watermark_interval = 50;
+    gen_config.checkpoint_interval = checkpoint_interval;
     
     PipelineConfig pipe_config;
     pipe_config.checkpoint_dir = tmp_dir;
