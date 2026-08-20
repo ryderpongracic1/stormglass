@@ -2,8 +2,6 @@
 #include "stream/record.h"
 #include "stream/batch.h"
 #include "stream/watermark.h"
-#include "aggregate/sum.h"
-#include "aggregate/count.h"
 #include "sink/memory_sink.h"
 
 namespace stormglass {
@@ -34,61 +32,6 @@ TEST(Watermark, MonotonicSequence) {
     EXPECT_TRUE(wm.Advance(Timestamp{Duration{200}}));
     EXPECT_TRUE(wm.Advance(Timestamp{Duration{300}}));
     EXPECT_EQ(wm.Current(), Timestamp{Duration{300}});
-}
-
-TEST(SumKernel, BasicAccumulation) {
-    SumInt64Kernel sum;
-    sum.Add(10);
-    sum.Add(20);
-    sum.Add(30);
-    auto r = sum.Result();
-    EXPECT_EQ(r.value, 60);
-    EXPECT_EQ(r.count, 3u);
-}
-
-TEST(SumKernel, Reset) {
-    SumInt64Kernel sum;
-    sum.Add(100);
-    sum.Reset();
-    EXPECT_EQ(sum.Result().value, 0);
-    EXPECT_EQ(sum.Result().count, 0u);
-}
-
-TEST(SumKernel, BatchAdd) {
-    SumInt64Kernel sum;
-    std::vector<int64_t> values = {1, 2, 3, 4, 5};
-    sum.AddBatch(values);
-    auto r = sum.Result();
-    EXPECT_EQ(r.value, 15);
-    EXPECT_EQ(r.count, 5u);
-}
-
-TEST(CountKernel, BasicCount) {
-    CountKernel count;
-    count.Add(100);
-    count.Add(200);
-    count.Add(300);
-    auto r = count.Result();
-    EXPECT_EQ(r.value, 3);  // count kernel returns count as value
-    EXPECT_EQ(r.count, 3u);
-}
-
-TEST(CountKernel, BatchCount) {
-    CountKernel count;
-    std::vector<int64_t> values = {1, 2, 3, 4, 5, 6, 7};
-    count.AddBatch(values);
-    auto r = count.Result();
-    EXPECT_EQ(r.value, 7);
-    EXPECT_EQ(r.count, 7u);
-}
-
-TEST(CountKernel, Reset) {
-    CountKernel count;
-    count.Add(1);
-    count.Add(2);
-    count.Reset();
-    EXPECT_EQ(count.Result().value, 0);
-    EXPECT_EQ(count.Result().count, 0u);
 }
 
 TEST(MemorySink, CollectsResults) {

@@ -85,7 +85,13 @@ Pipeline::Stats Pipeline::Run() {
                                 any_late_accepted = true;
                             }
                         } else {
-                            state_.Add(r.key, w, r.value);
+                            // L == 0: deadline is window.end + 0. Without this, a
+                            // record arriving after its window fired (and its panes
+                            // were erased) would create a fresh pane that re-fires a
+                            // spurious partial result at final flush.
+                            bool accepted = state_.AddWithLateness(
+                                r.key, w, r.value, watermark_.Current());
+                            if (!accepted) any_dropped = true;
                         }
                     }
                     if (any_dropped) stats.late_records_dropped++;

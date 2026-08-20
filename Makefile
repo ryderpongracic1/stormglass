@@ -23,7 +23,7 @@ oracle: release
 	./$(RELEASE_DIR)/app/stormglass_oracle --seeds 100 --records 10000
 
 nemesis: release
-	./$(RELEASE_DIR)/app/stormglass_nemesis --seeds 20 --verbose
+	./$(RELEASE_DIR)/app/stormglass_nemesis --real-kill --real-phase between --seeds 20
 
 clean:
 	rm -rf $(BUILD_DIR) $(RELEASE_DIR)

@@ -35,7 +35,8 @@ Source → [Watermark | Checkpoint Barrier] → Keyed Window Operator → Sink
 
 | Metric | Value | How measured |
 |--------|-------|--------------|
-| Pipeline throughput | median ~9.0 M rec/s (observed 8.2–9.1) | 1M records, tumbling 1s (1000 windows fired), Release -O3 -march=native, 8 runs on shared 4-vCPU Xeon 6975P-C. Earlier builds measured ~1.8 M rec/s with 1.3–3.1 spread; the window-end-ordered pane index removed the per-watermark full-pane scan, which was both the bottleneck and the variance source |
+| Pipeline throughput (default config) | ~8.5–9.0 M rec/s | 1M records, 100 keys (~100 live panes), tumbling 1s, Release -O3 -march=native, interleaved A/B reps on 4-vCPU Xeon 6975P-C. At this config the window-end-ordered pane index is performance-neutral (within noise, ~4% ordered-map overhead vs the old flat map) — ~100 panes were never the bottleneck. An earlier published ~1.8 M rec/s figure was measured on the same box under contention and has been retracted as an engine number |
+| Pane-index scaling (isolation bench) | flat ~10 M rec/s at 20K live panes, all watermark rates | `stormglass_scanbench`: before the index, throughput swung 16× with watermark frequency (O(advances × live panes) full-map scan) and collapsed 11× as pane count grew; after, both sweeps are flat within ~1.1×. This regime — many live panes (keys × windows in flight) — is where the index matters |
 | Checkpoint pause | ~5.6 ms at 1000 panes (~9.2 ms at 10K) | Direct measurement in `make bench` (Checkpoint Pause section): 20 writes each of serialize + fsync + rename + dir-fsync. Dominated by fsync, not serialization |
 
 ## Verification
@@ -61,10 +62,15 @@ The nemesis fork()s a child running the real pipeline and SIGKILLs it before the
 ## Reproduce
 
 ```bash
-make build && make test              # 99 tests, Debug (+ASan where the runtime is available)
-make bench                           # Release throughput numbers
+make build && make test              # 94 tests, Debug (+ASan where the runtime is available)
+make bench                           # Release throughput + checkpoint-pause numbers
+./build-release/app/stormglass_scanbench   # pane-index isolation sweeps
 ./build-release/app/stormglass_oracle --seeds 100 --records 10000
-./build-release/app/stormglass_nemesis --seeds 20 --verbose
+./build-release/app/stormglass_oracle --matrix --seeds 20 --records 10000 \
+    --lateness-ms 2000 --late-fraction 0.1 --late-tail-ms 6000
+./build-release/app/stormglass_nemesis --real-kill --real-phase between --seeds 20
+./build-release/app/stormglass_nemesis --real-kill --real-phase mid-checkpoint \
+    --records 30000 --checkpoint-interval 500 --keys 100 --seeds 6
 ```
 
 ## Limitations

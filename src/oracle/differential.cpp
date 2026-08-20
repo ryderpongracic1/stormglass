@@ -185,12 +185,10 @@ DifferentialResult RunDifferential(const DifferentialConfig& config) {
         auto mismatch = CompareResults(engine_results, oracle_results);
 
         // --- Drop-count contract ---
-        // With allowed_lateness > 0 the engine actually drops beyond-deadline
-        // records and both sides must agree on the count. With lateness == 0 the
-        // engine takes the no-lateness path (which re-accumulates rather than
-        // counting drops), so its counter is 0 by construction; the oracle's
-        // predicted drops are still reported as evidence but not asserted equal.
-        if (mismatch.empty() && config.allowed_lateness > Duration{0} &&
+        // The engine drops beyond-deadline records at every lateness setting
+        // (L == 0 means deadline == window.end), so engine and oracle must
+        // agree on the count in every cell.
+        if (mismatch.empty() &&
             stats.late_records_dropped != oracle.PredictedDropCount()) {
             char buf[256];
             std::snprintf(buf, sizeof(buf),

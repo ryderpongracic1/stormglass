@@ -2,7 +2,11 @@
 
 #include "oracle/differential.h"
 #include "source/generator.h"
+#include "engine/pipeline.h"
+#include "sink/memory_sink.h"
+#include "window/tumbling.h"
 
+#include <map>
 #include <variant>
 
 namespace stormglass {
@@ -181,6 +185,45 @@ TEST(HeavyTailedGuard, SeedStartSelectsContiguousRange) {
     auto r = RunDifferential(config);
     EXPECT_EQ(r.seeds_tested, 3u);
     EXPECT_EQ(r.seeds_failed, 0u) << "first failure: " << r.failure_detail;
+}
+
+
+// Regression guard for the L=0 spurious-emission bug: with allowed_lateness == 0,
+// a record arriving after its window fired used to create a fresh pane that
+// re-fired a spurious partial result at final flush. DedupEngineResults masked
+// this from the differential. Assert on the RAW sink output: at most one
+// emission per (key, window) when no crash is involved, and the engine's drop
+// counter must match the oracle-style expectation of counting the stragglers.
+TEST(HeavyTailedGuard, NoSpuriousReEmissionsAtZeroLateness) {
+    GeneratorConfig g{};
+    g.seed = 42;
+    g.num_records = 100000;
+    g.num_keys = 10;
+    g.max_disorder = Duration{500};
+    g.watermark_interval = 100;
+    g.disorder_mode = DisorderMode::kHeavyTailed;
+    g.late_fraction = 0.1;
+    g.late_tail = Duration{6000};
+
+    auto sink = std::make_unique<MemorySink>();
+    auto* sink_ptr = sink.get();
+    Pipeline pipeline(std::make_unique<DeterministicGenerator>(g),
+                      std::make_unique<TumblingAssigner>(Duration{1000}),
+                      std::move(sink));
+    auto stats = pipeline.Run();
+
+    std::map<std::pair<std::string, int64_t>, int> emissions;
+    for (const auto& r : sink_ptr->Results()) {
+        emissions[{r.key, r.window.start.time_since_epoch().count()}]++;
+    }
+    uint64_t spurious = 0;
+    for (const auto& [kw, n] : emissions) {
+        if (n > 1) spurious += static_cast<uint64_t>(n - 1);
+    }
+    EXPECT_EQ(spurious, 0u)
+        << "post-fire stragglers at L=0 must be dropped, not re-accumulated";
+    // The stragglers exist (heavy-tailed guarantees them) and must be counted.
+    EXPECT_GT(stats.late_records_dropped, 0u);
 }
 
 }  // namespace
