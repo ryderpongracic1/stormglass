@@ -7,7 +7,7 @@ Single-process event-time stream processor. Tumbling and sliding windows, bounde
 ## What this proves
 
 - **distrikv**: consensus, replication, convergence under partition — infrastructure-layer distributed systems (Go, gRPC, Raft)
-- **stormglass**: semantic correctness of temporal computations under failure — application-layer stream processing (C++20, SIMD, event-time)
+- **stormglass**: semantic correctness of temporal computations under failure — application-layer stream processing (C++20, event-time)
 - Different failure model (time disorder vs network partition), different verification (oracle comparison vs convergence), different systems lineage (Flink/Dataflow vs Dynamo/Raft)
 
 ## Architecture
@@ -28,16 +28,14 @@ Source → [Watermark | Checkpoint Barrier] → Keyed Window Operator → Sink
 
 1. **Snapshot checkpoint, not delta-WAL** — window state is bounded and self-expiring; the source is the replay log
 2. **Real in-band Chandy-Lamport barrier** — the source emits a checkpoint-barrier control record stamped with the absolute source offset; the operator snapshots when it dequeues it. In-order processing on a single path means everything ≤ the barrier offset is applied and nothing after it is (the degenerate, single-input case); extends to multi-input alignment in v2 without rewrite
-3. **SIMD aggregation kernels** — explicit AVX2/SSE4.2 intrinsics for contiguous int64 spans, measured speedup varies 1.1–3.2× on shared infra (median ~1.5×)
-4. **Bounded out-of-orderness watermarks** — wm = max_event_time − disorder bound; in-band as control records
-5. **Single-threaded by design** — eliminates data races; concurrency is v2's problem
+3. **Bounded out-of-orderness watermarks** — wm = max_event_time − disorder bound; in-band as control records
+4. **Single-threaded by design** — eliminates data races; concurrency is v2's problem
 
 ## Measured results
 
 | Metric | Value | How measured |
 |--------|-------|--------------|
 | Pipeline throughput | median ~1.8 M rec/s (observed 1.3–3.1) | 1M records, tumbling 1s (1000 windows fired), Release -O3 -march=native, 8 runs on shared 4-vCPU Xeon 6975P-C. Wide range is CPU-scheduling noise on shared infra |
-| SIMD kernel speedup | median ~1.5× (observed 1.1–3.2) | AVX2 sum vs scalar over 1M int64 elements (100 iterations), 8 runs. Same shared-infra variance; both kernels are memory-bandwidth-sensitive so the ratio is noisy |
 | Checkpoint pause | ~7 ms at 1000 panes (~12 ms at 10K) | Direct measurement in `make bench` (Checkpoint Pause section): 20 writes each of serialize + fsync + rename + dir-fsync. Dominated by fsync, not serialization |
 
 ## Verification
@@ -55,7 +53,7 @@ Nemesis stops the pipeline at targeted record counts (between checkpoints, at ch
 ## Reproduce
 
 ```bash
-make build && make test              # 122 tests, Debug (+ASan where the runtime is available)
+make build && make test              # 99 tests, Debug (+ASan where the runtime is available)
 make bench                           # Release throughput numbers
 ./build-release/app/stormglass_oracle --seeds 100 --records 10000
 ./build-release/app/stormglass_nemesis --seeds 20 --verbose
@@ -67,8 +65,7 @@ make bench                           # Release throughput numbers
 - At-least-once, not exactly-once (idempotent sink upgrades to effectively-once; not built)
 - Checkpoint pauses the operator (upgrade path: clone-then-serialize-async)
 - No persistent source integration (v2: Postgres CDC via logical decoding)
-- SIMD kernels proven in isolation; pipeline uses scalar per-pane accumulation (vectorized window operator is the v2 optimization)
 
 ## Tech stack
 
-C++20 · GCC 11 · CMake · GoogleTest · AVX2/SSE4.2 · POSIX (fsync, atomic rename)
+C++20 · GCC 11 · CMake · GoogleTest · POSIX (fsync, atomic rename)
