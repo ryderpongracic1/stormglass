@@ -320,3 +320,45 @@ TEST(RealKillNemesis, MultiRunZeroMissingCountsDuplicates) {
     // replayed). We only require them to be counted, not zero.
     RecordProperty("total_duplicates", static_cast<int>(total_duplicates));
 }
+
+// Cross-axis coverage: a genuine crash WHILE late data is in flight (heavy-tailed
+// disorder + allowed_lateness > 0). This is the quadrant the two verification
+// axes never crossed — the oracle matrix tests late data but never crashes, and
+// the other real-kill tests crash but only under bounded/L=0 disorder.
+//
+// It pins a non-obvious invariant: restore resets the watermark backward to the
+// checkpointed value, but replay feeds the identical record sequence, so the
+// watermark trajectory re-derives exactly and every drop/accept decision is
+// recovery-deterministic. A straggler correctly dropped pre-crash is dropped
+// again on replay; an already-emitted window's value cannot change. If that
+// held only by accident, this test (union == oracle, values included) would
+// catch a regression.
+TEST(RealKillNemesis, LateDataInFlightZeroMissing) {
+    // Small workload deliberately: DurableFileSink fsyncs every emit, and
+    // allowed_lateness makes windows re-fire, so emission count (and thus fsync
+    // cost) balloons. A large workload would take minutes for the parent to
+    // reach the target checkpoint. The invariant under test is scale-free.
+    RealKillConfig config{};
+    config.seed = 42;
+    config.num_records = 6000;
+    config.num_keys = 20;
+    config.checkpoint_interval = 500;
+    config.kill_point = RealKillPoint::kBetweenCheckpoints;
+    config.target_checkpoint = 2;
+    config.max_disorder = Duration{500};
+    config.disorder_mode = DisorderMode::kHeavyTailed;
+    config.late_fraction = 0.1;
+    config.late_tail = Duration{6000};
+    config.allowed_lateness = Duration{2000};
+
+    auto result = RunRealKillNemesis(config);
+
+    EXPECT_TRUE(result.passed) << result.failure_detail;
+    EXPECT_EQ(result.missing_results, 0u)
+        << "crash recovery with late data in flight must not change any "
+           "already-emitted window value (watermark is a pure function of the "
+           "replayed prefix)";
+    EXPECT_TRUE(result.killed_by_sigkill);
+    EXPECT_FALSE(result.final_flush_completed);
+    RecordProperty("total_duplicates", static_cast<int>(result.duplicates));
+}

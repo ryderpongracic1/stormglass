@@ -18,6 +18,13 @@ void PrintUsage() {
         "  --real-kill            Headline mode: genuine fork() + SIGKILL crash\n"
         "  --real-phase <between|mid-checkpoint>  real-kill point (default: between)\n"
         "  --keys N               Keys per run, real-kill only (default: 50)\n"
+        "  --disorder-profile <bounded|heavy-tailed>  real-kill (default: bounded)\n"
+        "  --late-fraction F      heavy-tail late-record fraction (default: 0)\n"
+        "  --late-tail-ms N       heavy-tail extra lateness bound (default: 0)\n"
+        "  --lateness-ms N        allowed lateness for real-kill (default: 0)\n"
+        "                         (heavy-tailed + lateness re-fires a lot and the\n"
+        "                          durable sink fsyncs each emit — use small\n"
+        "                          --records, e.g. 6000)\n"
         "  --verbose              Print per-run details\n"
         "  --help                 Show this help\n");
 }
@@ -66,7 +73,9 @@ int RunInProcess(uint64_t num_seeds, uint64_t num_records,
 }
 
 int RunRealKill(uint64_t num_seeds, uint64_t num_records, uint64_t checkpoint_interval,
-                uint32_t num_keys, RealKillPoint point, bool verbose) {
+                uint32_t num_keys, RealKillPoint point, bool verbose,
+                DisorderMode disorder_mode, double late_fraction,
+                uint64_t late_tail_ms, uint64_t lateness_ms) {
     const char* point_name =
         (point == RealKillPoint::kMidCheckpoint) ? "mid-checkpoint" : "between-checkpoints";
 
@@ -81,6 +90,10 @@ int RunRealKill(uint64_t num_seeds, uint64_t num_records, uint64_t checkpoint_in
         config.seed = 42 + i;
         config.num_records = num_records;
         config.num_keys = num_keys;
+        config.disorder_mode = disorder_mode;
+        config.late_fraction = late_fraction;
+        config.late_tail = Duration{static_cast<int64_t>(late_tail_ms)};
+        config.allowed_lateness = Duration{static_cast<int64_t>(lateness_ms)};
         config.checkpoint_interval = checkpoint_interval;
         config.kill_point = point;
 
@@ -135,6 +148,10 @@ int main(int argc, char* argv[]) {
     bool verbose = false;
     bool records_set = false;
     bool interval_set = false;
+    DisorderMode disorder_mode = DisorderMode::kBounded;
+    double late_fraction = 0.0;
+    uint64_t late_tail_ms = 0;
+    uint64_t lateness_ms = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--seeds") == 0 && i + 1 < argc) {
@@ -171,6 +188,22 @@ int main(int argc, char* argv[]) {
                 std::fprintf(stderr, "Unknown real-phase: %s\n", argv[i]);
                 return 1;
             }
+        } else if (std::strcmp(argv[i], "--disorder-profile") == 0 && i + 1 < argc) {
+            ++i;
+            if (std::strcmp(argv[i], "heavy-tailed") == 0) {
+                disorder_mode = DisorderMode::kHeavyTailed;
+            } else if (std::strcmp(argv[i], "bounded") == 0) {
+                disorder_mode = DisorderMode::kBounded;
+            } else {
+                std::fprintf(stderr, "Unknown disorder-profile: %s\n", argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--late-fraction") == 0 && i + 1 < argc) {
+            late_fraction = std::strtod(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--late-tail-ms") == 0 && i + 1 < argc) {
+            late_tail_ms = std::strtoull(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--lateness-ms") == 0 && i + 1 < argc) {
+            lateness_ms = std::strtoull(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
         } else if (std::strcmp(argv[i], "--help") == 0) {
@@ -189,7 +222,8 @@ int main(int argc, char* argv[]) {
         if (!num_records || (!records_set && num_records == 50000)) num_records = 40000;
         if (!interval_set && checkpoint_interval == 5000) checkpoint_interval = 1000;
         return RunRealKill(num_seeds, num_records, checkpoint_interval, num_keys,
-                           real_point, verbose);
+                           real_point, verbose, disorder_mode, late_fraction,
+                           late_tail_ms, lateness_ms);
     }
 
     return RunInProcess(num_seeds, num_records, checkpoint_interval, phase, verbose);

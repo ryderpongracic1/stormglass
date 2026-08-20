@@ -59,6 +59,16 @@ The oracle computes expected results naively — no watermarks, just group-by-wi
 
 The nemesis fork()s a child running the real pipeline and SIGKILLs it before the final flush (verified per run: the child never reaches its post-flush sentinel), so in-memory window state genuinely dies. Pre-crash results survive only because the sink fsyncs each emitted window — that durable output, unioned with the post-restore run, must cover the oracle exactly (at-least-once). Duplicates are counted, not suppressed; at the default checkpoint spacing the union is a clean partition (0 duplicates), and an idempotent sink upgrades to effectively-once. Double-crash restore is separately tested to pin absolute-offset checkpoint semantics.
 
+Crash recovery is also tested *with late data in flight* (heavy-tailed disorder
++ allowed_lateness > 0) — the quadrant where the late-data and crash axes cross.
+This pins a non-obvious invariant: restore resets the watermark backward to the
+checkpointed value, but replay feeds the identical record sequence, so the
+watermark trajectory re-derives exactly and every drop/accept decision is
+recovery-deterministic. A straggler correctly dropped before the crash is
+dropped again on replay; an already-emitted window's value cannot change. The
+watermark is a pure function of the replayed prefix, so parallelism-free
+determinism survives the crash.
+
 ## Reproduce
 
 ```bash

@@ -298,6 +298,9 @@ GeneratorConfig MakeRealGenConfig(const RealKillConfig& config) {
         .batch_size = 1024,
         .watermark_interval = 100,
         .checkpoint_interval = config.checkpoint_interval,
+        .disorder_mode = config.disorder_mode,
+        .late_fraction = config.late_fraction,
+        .late_tail = config.late_tail,
     };
 }
 
@@ -313,6 +316,7 @@ void RunRealKillChild(const RealKillConfig& config, const std::string& ckpt_dir,
     PipelineConfig pconfig{};
     pconfig.checkpoint_dir = ckpt_dir;
     pconfig.checkpoint_interval = config.checkpoint_interval;
+    pconfig.allowed_lateness = config.allowed_lateness;
 
     Pipeline pipeline(std::move(gen), std::move(assigner), std::move(sink), pconfig);
     pipeline.Run();  // includes final flush of all in-memory windows
@@ -452,6 +456,7 @@ RealKillResult RunRealKillNemesis(const RealKillConfig& config) {
         PipelineConfig pconfig{};
         pconfig.checkpoint_dir = ckpt_dir;
         pconfig.checkpoint_interval = config.checkpoint_interval;
+        pconfig.allowed_lateness = config.allowed_lateness;
 
         Pipeline pipeline(std::move(gen), std::move(assigner), std::move(sink), pconfig);
         auto stats = pipeline.Run();
@@ -477,13 +482,21 @@ RealKillResult RunRealKillNemesis(const RealKillConfig& config) {
     result.union_results = combined.size();
     result.duplicates = (pre.size() + post.size()) - combined.size();
 
-    // Oracle over the full dataset (naive group-by-window, no watermarks).
-    Oracle oracle(OracleConfig{.window_size = config.window_size});
+    // Oracle over the full dataset. With allowed_lateness > 0 the oracle must
+    // be watermark-fed so it predicts the same beyond-deadline drops the engine
+    // makes; otherwise it would include late-dropped records and its window
+    // values would diverge from the (correct) crash-recovered engine output.
+    Oracle oracle(OracleConfig{.window_size = config.window_size,
+                               .allowed_lateness = config.allowed_lateness});
     DeterministicGenerator oracle_gen(MakeRealGenConfig(config));
     while (auto batch = oracle_gen.Next()) {
         for (auto& item : batch->items) {
             if (auto* r = std::get_if<Record>(&item)) {
                 oracle.AddRecord(*r);
+            } else if (auto* c = std::get_if<ControlRecord>(&item)) {
+                if (c->type == ControlType::kWatermark) {
+                    oracle.AdvanceWatermark(c->watermark);
+                }
             }
         }
     }

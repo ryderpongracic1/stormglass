@@ -1,6 +1,7 @@
 #pragma once
 
 #include "stream/record.h"
+#include "source/generator.h"  // DisorderMode
 
 #include <cstdint>
 #include <string>
@@ -61,6 +62,14 @@ struct RealKillConfig {
     Duration max_disorder{500};
     uint64_t checkpoint_interval = 1000;
     RealKillPoint kill_point = RealKillPoint::kBetweenCheckpoints;
+
+    // Cross-axis coverage: crash recovery WITH late data in flight. Default is
+    // bounded / L=0 (the original behavior); set these to run heavy-tailed
+    // disorder against a non-zero allowed lateness.
+    DisorderMode disorder_mode = DisorderMode::kBounded;
+    double late_fraction = 0.0;
+    Duration late_tail{0};
+    Duration allowed_lateness{0};
 
     // kBetweenCheckpoints: SIGKILL once this many completed checkpoints exist.
     uint32_t target_checkpoint = 2;
