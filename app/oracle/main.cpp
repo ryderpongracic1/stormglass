@@ -29,6 +29,10 @@ void PrintUsage() {
         "  --late-tail-ms N     Max extra lateness beyond disorder (default: 6000)\n"
         "  --matrix             Run the full {tumbling,sliding} x {L=0,L>0}\n"
         "                       x {bounded,heavy-tailed} matrix and exit\n"
+        "  --workers N          Engine workers: 1 = single-threaded Pipeline\n"
+        "                       (default), >1 = PartitionedPipeline at N workers\n"
+        "  --cross-n            Run PartitionedPipeline at N in {1,2,4,8}; assert\n"
+        "                       each == oracle AND == single-threaded per seed, exit\n"
         "  --verbose            Print per-seed results\n"
         "  --help               Show this message\n");
 }
@@ -49,6 +53,36 @@ bool RunAndReport(const DifferentialConfig& config, const char* label) {
 
     std::printf(
         "%-46s %s  %llu/%llu seeds | engine_drop=%llu oracle_drop=%llu "
+        "refired=%llu late_accepted=%llu\n",
+        label, ok ? "PASS" : "FAIL",
+        static_cast<unsigned long long>(r.seeds_passed),
+        static_cast<unsigned long long>(r.seeds_tested),
+        static_cast<unsigned long long>(r.engine_late_dropped),
+        static_cast<unsigned long long>(r.oracle_predicted_drops),
+        static_cast<unsigned long long>(r.engine_windows_refired),
+        static_cast<unsigned long long>(r.engine_late_accepted));
+
+    if (!ok) {
+        std::printf("    FAILED seeds:");
+        for (auto s : r.failed_seeds) {
+            std::printf(" %llu", static_cast<unsigned long long>(s));
+        }
+        std::printf("\n    First failure: %s\n", r.failure_detail.c_str());
+    }
+    return ok;
+}
+
+/// Run the cross-N proof for one configuration and print a one-line summary.
+/// A seed passes only when PartitionedPipeline at EVERY N in {1,2,4,8} matches
+/// both the oracle and the single-threaded reference (result set + drop count).
+/// Returns true on pass.
+bool RunCrossNAndReport(const DifferentialConfig& config, const char* label) {
+    auto r = stormglass::RunCrossN(config);
+    bool ok = r.seeds_failed == 0;
+
+    std::printf(
+        "%-46s %s  %llu/%llu seeds | N={1,2,4,8}: engine(N)==oracle && "
+        "engine(N)==single-threaded | engine_drop=%llu oracle_drop=%llu "
         "refired=%llu late_accepted=%llu\n",
         label, ok ? "PASS" : "FAIL",
         static_cast<unsigned long long>(r.seeds_passed),
@@ -112,6 +146,7 @@ int main(int argc, char* argv[]) {
     config.late_fraction = 0.1;
     config.late_tail = Duration{6000};
     bool matrix = false;
+    bool cross_n = false;
 
     auto need_arg = [&](int i) -> bool {
         if (i + 1 >= argc) {
@@ -164,6 +199,10 @@ int main(int argc, char* argv[]) {
             config.late_tail = Duration{std::strtoll(argv[++i], nullptr, 10)};
         } else if (std::strcmp(argv[i], "--matrix") == 0) {
             matrix = true;
+        } else if (std::strcmp(argv[i], "--workers") == 0 && need_arg(i)) {
+            config.workers = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--cross-n") == 0) {
+            cross_n = true;
         } else if (std::strcmp(argv[i], "--verbose") == 0) {
             config.verbose = true;
         } else if (std::strcmp(argv[i], "--help") == 0) {
@@ -180,16 +219,32 @@ int main(int argc, char* argv[]) {
         return RunMatrix(config);
     }
 
+    if (cross_n) {
+        std::printf(
+            "Cross-N proof: %llu seeds from %llu, %llu records each "
+            "(%s, window=%lldms, L=%lldms, %s); N in {1,2,4,8}\n",
+            static_cast<unsigned long long>(config.num_seeds),
+            static_cast<unsigned long long>(config.seed_start),
+            static_cast<unsigned long long>(config.records_per_seed),
+            AssignerName(config.assigner),
+            static_cast<long long>(config.window_size.count()),
+            static_cast<long long>(config.allowed_lateness.count()),
+            DisorderName(config.disorder_mode));
+        bool ok = RunCrossNAndReport(config, "cross-n");
+        return ok ? 0 : 1;
+    }
+
     std::printf(
         "Differential test: %llu seeds from %llu, %llu records each "
-        "(%s, window=%lldms, L=%lldms, %s)\n",
+        "(%s, window=%lldms, L=%lldms, %s, workers=%u)\n",
         static_cast<unsigned long long>(config.num_seeds),
         static_cast<unsigned long long>(config.seed_start),
         static_cast<unsigned long long>(config.records_per_seed),
         AssignerName(config.assigner),
         static_cast<long long>(config.window_size.count()),
         static_cast<long long>(config.allowed_lateness.count()),
-        DisorderName(config.disorder_mode));
+        DisorderName(config.disorder_mode),
+        config.workers);
 
     bool ok = RunAndReport(config, "run");
     return ok ? 0 : 1;
