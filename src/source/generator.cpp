@@ -14,8 +14,9 @@ Record DeterministicGenerator::GenerateRecord() {
     std::snprintf(key_buf, sizeof(key_buf), "key-%04u",
                   static_cast<unsigned>(offset_ % config_.num_keys));
 
-    // Event time: monotonically increasing base (1ms apart) + disorder.
-    auto base_ms = static_cast<int64_t>(offset_);  // 1ms per record
+    // Event time: monotonically increasing base (event_time_step ms apart) +
+    // disorder. Default step == 1 reproduces the original 1ms-per-record stream.
+    auto base_ms = static_cast<int64_t>(offset_) * config_.event_time_step;
     int64_t event_ms;
     if (config_.disorder_mode == DisorderMode::kHeavyTailed &&
         config_.late_fraction > 0.0) {

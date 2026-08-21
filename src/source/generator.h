@@ -22,6 +22,15 @@ struct GeneratorConfig {
     uint64_t seed = 42;
     uint32_t num_keys = 10;
     uint64_t num_records = 100000;
+
+    // Event-time base advances by this many ms per record (base_ms = offset *
+    // event_time_step). Default 1 reproduces the original 1ms-per-record stream
+    // bit-for-bit. SourceMerge sets DIVERGENT steps across its wrapped sources so
+    // their watermarks (wm = max_seen - max_disorder) advance at different rates,
+    // making the MIN-combine non-trivial: a slow (small-step) source holds the
+    // merged watermark back and gates downstream firing.
+    int64_t event_time_step = 1;
+
     Duration max_disorder{5000};
     uint32_t batch_size = 1024;
     uint32_t watermark_interval = 100;

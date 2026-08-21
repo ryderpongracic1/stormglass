@@ -31,6 +31,10 @@ void PrintUsage() {
         "                       x {bounded,heavy-tailed} matrix and exit\n"
         "  --workers N          Engine workers: 1 = single-threaded Pipeline\n"
         "                       (default), >1 = PartitionedPipeline at N workers\n"
+        "  --sources K          Multi-source (v3): merge K DeterministicGenerators\n"
+        "                       with divergent event-time rates behind the engine\n"
+        "                       (respects --workers), assert engine==oracle over the\n"
+        "                       merged stream, exit. K=1 == the single-source path.\n"
         "  --cross-n            Run PartitionedPipeline at N in {1,2,4,8}; assert\n"
         "                       each == oracle AND == single-threaded per seed, exit\n"
         "  --verbose            Print per-seed results\n"
@@ -49,6 +53,35 @@ const char* DisorderName(DisorderMode d) {
 /// Returns true on pass.
 bool RunAndReport(const DifferentialConfig& config, const char* label) {
     auto r = stormglass::RunDifferential(config);
+    bool ok = r.seeds_failed == 0;
+
+    std::printf(
+        "%-46s %s  %llu/%llu seeds | engine_drop=%llu oracle_drop=%llu "
+        "refired=%llu late_accepted=%llu\n",
+        label, ok ? "PASS" : "FAIL",
+        static_cast<unsigned long long>(r.seeds_passed),
+        static_cast<unsigned long long>(r.seeds_tested),
+        static_cast<unsigned long long>(r.engine_late_dropped),
+        static_cast<unsigned long long>(r.oracle_predicted_drops),
+        static_cast<unsigned long long>(r.engine_windows_refired),
+        static_cast<unsigned long long>(r.engine_late_accepted));
+
+    if (!ok) {
+        std::printf("    FAILED seeds:");
+        for (auto s : r.failed_seeds) {
+            std::printf(" %llu", static_cast<unsigned long long>(s));
+        }
+        std::printf("\n    First failure: %s\n", r.failure_detail.c_str());
+    }
+    return ok;
+}
+
+/// Run the multi-source (v3) proof for one configuration and print a one-line
+/// summary. Each seed builds a SourceMerge of K generators with divergent
+/// event-time rates behind the selected engine, and asserts engine == oracle
+/// over the merged stream. Returns true on pass.
+bool RunMultiSourceAndReport(const DifferentialConfig& config, const char* label) {
+    auto r = stormglass::RunMultiSourceDifferential(config);
     bool ok = r.seeds_failed == 0;
 
     std::printf(
@@ -147,6 +180,7 @@ int main(int argc, char* argv[]) {
     config.late_tail = Duration{6000};
     bool matrix = false;
     bool cross_n = false;
+    bool multi_source = false;
 
     auto need_arg = [&](int i) -> bool {
         if (i + 1 >= argc) {
@@ -203,6 +237,9 @@ int main(int argc, char* argv[]) {
             config.workers = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--cross-n") == 0) {
             cross_n = true;
+        } else if (std::strcmp(argv[i], "--sources") == 0 && need_arg(i)) {
+            config.sources = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+            multi_source = true;
         } else if (std::strcmp(argv[i], "--verbose") == 0) {
             config.verbose = true;
         } else if (std::strcmp(argv[i], "--help") == 0) {
@@ -217,6 +254,25 @@ int main(int argc, char* argv[]) {
 
     if (matrix) {
         return RunMatrix(config);
+    }
+
+    if (multi_source) {
+        const uint32_t k = config.sources < 1 ? 1 : config.sources;
+        std::printf(
+            "Multi-source (v3) differential: %llu seeds from %llu, %llu records "
+            "per source each, K=%u sources (%s, window=%lldms, L=%lldms, %s, "
+            "workers=%u); engine==oracle over the merged stream\n",
+            static_cast<unsigned long long>(config.num_seeds),
+            static_cast<unsigned long long>(config.seed_start),
+            static_cast<unsigned long long>(config.records_per_seed),
+            k,
+            AssignerName(config.assigner),
+            static_cast<long long>(config.window_size.count()),
+            static_cast<long long>(config.allowed_lateness.count()),
+            DisorderName(config.disorder_mode),
+            config.workers);
+        bool ok = RunMultiSourceAndReport(config, "multi-source");
+        return ok ? 0 : 1;
     }
 
     if (cross_n) {

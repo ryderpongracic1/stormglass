@@ -41,6 +41,13 @@ struct DifferentialConfig {
     // DedupEngineResults, drop-count contract, result-set compare) is IDENTICAL
     // and SHARED between the two paths: the oracle never learns which engine ran.
     uint32_t workers = 1;
+
+    // Multi-source (v3) fan-in. 1 (default) is a single source — the original
+    // path. >1 drives a SourceMerge of K DeterministicGenerators with DIVERGENT
+    // per-source event-time rates behind whichever engine `workers` selects.
+    // Read ONLY by RunMultiSourceDifferential; the single-source harnesses ignore
+    // it, so they stay byte-for-byte unchanged.
+    uint32_t sources = 1;
 };
 
 struct DifferentialResult {
@@ -109,5 +116,23 @@ struct CrossNResult {
 /// oracle and the same reference, cross-N identity (partitioned(N) equal for all
 /// N, and equal to single-threaded) is proven transitively and directly.
 CrossNResult RunCrossN(const DifferentialConfig& config);
+
+/// The v3 multi-source proof. For each seed it builds a SourceMerge of K
+/// DeterministicGenerators (K = config.sources) whose event-time rates DIVERGE,
+/// so the effective watermark is genuinely the MIN across channels and a slow
+/// source gates firing. It then:
+///   1. Runs the engine (single-threaded when config.workers <= 1, else the
+///      PartitionedPipeline at config.workers) over that SAME SourceMerge.
+///   2. Feeds the UNCHANGED oracle the SAME merged stream — records via
+///      AddRecord in merged order, the min-combined watermarks via
+///      AdvanceWatermark — and applies its existing group-by-window + lateness
+///      logic. The oracle does NOT re-derive min-combine; it consumes whatever
+///      merged trajectory SourceMerge emits.
+///   3. Asserts engine == oracle over the deduped result set + the drop-count
+///      contract, exactly like RunDifferential.
+///
+/// K == 1 reduces to a literal single-source passthrough, so its result set is
+/// identical to the single-source path (regression guard).
+DifferentialResult RunMultiSourceDifferential(const DifferentialConfig& config);
 
 }  // namespace stormglass

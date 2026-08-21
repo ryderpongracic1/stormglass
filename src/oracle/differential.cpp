@@ -4,6 +4,7 @@
 #include "engine/partitioned_pipeline.h"
 #include "sink/memory_sink.h"
 #include "source/generator.h"
+#include "source/source_merge.h"
 #include "window/sliding.h"
 #include "window/tumbling.h"
 
@@ -399,6 +400,172 @@ CrossNResult RunCrossN(const DifferentialConfig& config) {
                 char buf[768];
                 std::snprintf(buf, sizeof(buf), "seed %llu: %s",
                               static_cast<unsigned long long>(seed),
+                              mismatch.c_str());
+                result.failure_detail = buf;
+            }
+            if (config.verbose) {
+                std::printf("  [seed %llu] FAIL: %s\n",
+                            static_cast<unsigned long long>(seed),
+                            mismatch.c_str());
+            }
+        }
+    }
+
+    return result;
+}
+
+// ===========================================================================
+// Multi-source (v3) harness. Builds a SourceMerge of K DeterministicGenerators
+// with DIVERGENT event-time rates, runs the engine over it, and feeds the
+// UNCHANGED oracle the SAME merged stream. Reuses MakeGenConfig / MakeAssigner-
+// Factory / EngineRun / OracleRun / DedupEngineResults / CheckDropContract — the
+// oracle-feeding and comparison code is LITERALLY the single-source code; only
+// the Source differs (SourceMerge instead of a bare DeterministicGenerator).
+// ===========================================================================
+
+namespace {
+
+/// Build the K-source merge config for one seed. Source 0 advances event-time
+/// FASTEST (largest step); source K-1 slowest — so the running MIN is pinned by
+/// the slow tail and the combine is non-trivial. Per-source seeds are spread so
+/// the channels are independent. K == 1 yields exactly MakeGenConfig(config,
+/// seed) with step 1, i.e. the single-source workload (regression guard).
+SourceMergeConfig MakeMergeConfig(const DifferentialConfig& config,
+                                  uint64_t seed, uint32_t k) {
+    SourceMergeConfig mc;
+    mc.checkpoint_interval = 0;   // differential does not checkpoint
+    mc.merged_batch_size = 1024;
+    for (uint32_t i = 0; i < k; ++i) {
+        GeneratorConfig g = MakeGenConfig(config, seed + static_cast<uint64_t>(i) * 7919u);
+        g.event_time_step = static_cast<int64_t>(k - i);  // source 0 fastest
+        mc.sources.push_back(g);
+    }
+    return mc;
+}
+
+EngineRun RunSingleThreadedEngineMerged(const DifferentialConfig& config,
+                                        const SourceMergeConfig& mc) {
+    auto factory = MakeAssignerFactory(config);
+    auto engine_sink = std::make_unique<MemorySink>();
+    auto* sink_ptr = engine_sink.get();
+
+    auto pipeline = Pipeline(
+        std::make_unique<SourceMerge>(mc),
+        factory(),
+        std::move(engine_sink),
+        PipelineConfig{.allowed_lateness = config.allowed_lateness});
+
+    auto stats = pipeline.Run();
+
+    EngineRun out;
+    out.results = DedupEngineResults(sink_ptr->Results());
+    SortResults(out.results);
+    out.late_dropped = stats.late_records_dropped;
+    out.late_accepted = stats.late_records_accepted;
+    out.windows_refired = stats.windows_refired;
+    return out;
+}
+
+EngineRun RunPartitionedEngineMerged(const DifferentialConfig& config,
+                                     const SourceMergeConfig& mc, uint32_t workers) {
+    auto engine_sink = std::make_unique<MemorySink>();
+    auto* sink_ptr = engine_sink.get();
+
+    PartitionedPipeline pipeline(
+        std::make_unique<SourceMerge>(mc),
+        MakeAssignerFactory(config),
+        std::move(engine_sink),
+        PartitionedPipelineConfig{.num_workers = workers,
+                                  .allowed_lateness = config.allowed_lateness});
+
+    auto stats = pipeline.Run();
+
+    EngineRun out;
+    out.results = DedupEngineResults(sink_ptr->Results());
+    SortResults(out.results);
+    out.late_dropped = stats.late_records_dropped;
+    out.late_accepted = stats.late_records_accepted;
+    out.windows_refired = stats.windows_refired;
+    return out;
+}
+
+/// The UNCHANGED oracle, fed the SAME merged stream a second SourceMerge
+/// produces: records in merged order via AddRecord, the min-combined watermarks
+/// via AdvanceWatermark. The oracle applies its existing lateness logic — it
+/// never re-derives min-combine.
+OracleRun RunOracleForMerged(const DifferentialConfig& config,
+                             const SourceMergeConfig& mc) {
+    const bool sliding = config.assigner == AssignerType::kSliding;
+    Oracle oracle(OracleConfig{
+        .window_size = config.window_size,
+        .slide = sliding ? config.slide : Duration{0},
+        .allowed_lateness = config.allowed_lateness,
+    });
+
+    SourceMerge replay(mc);
+    while (auto batch = replay.Next()) {
+        for (const auto& item : batch->items) {
+            if (std::holds_alternative<Record>(item)) {
+                oracle.AddRecord(std::get<Record>(item));
+            } else if (std::holds_alternative<ControlRecord>(item)) {
+                const auto& ctrl = std::get<ControlRecord>(item);
+                if (ctrl.type == ControlType::kWatermark) {
+                    oracle.AdvanceWatermark(ctrl.watermark);
+                }
+            }
+        }
+    }
+
+    OracleRun out;
+    out.results = oracle.ComputeResults();
+    out.drops = oracle.PredictedDropCount();
+    return out;
+}
+
+}  // namespace
+
+DifferentialResult RunMultiSourceDifferential(const DifferentialConfig& config) {
+    DifferentialResult result{};
+
+    const uint32_t k = std::max<uint32_t>(1, config.sources);
+    const uint64_t last_seed = config.seed_start + config.num_seeds - 1;
+
+    for (uint64_t seed = config.seed_start; seed <= last_seed; ++seed) {
+        result.seeds_tested++;
+
+        const auto mc = MakeMergeConfig(config, seed, k);
+
+        // Engine over the SourceMerge (single-threaded or partitioned), and the
+        // UNCHANGED oracle over the SAME merged stream.
+        EngineRun engine = (config.workers <= 1)
+                               ? RunSingleThreadedEngineMerged(config, mc)
+                               : RunPartitionedEngineMerged(config, mc, config.workers);
+        OracleRun oracle = RunOracleForMerged(config, mc);
+
+        result.engine_late_dropped += engine.late_dropped;
+        result.engine_late_accepted += engine.late_accepted;
+        result.engine_windows_refired += engine.windows_refired;
+        result.oracle_predicted_drops += oracle.drops;
+
+        auto mismatch = CompareResults(engine.results, oracle.results);
+        if (mismatch.empty()) {
+            mismatch = CheckDropContract(engine.late_dropped, oracle.drops);
+        }
+
+        if (mismatch.empty()) {
+            result.seeds_passed++;
+            if (config.verbose) {
+                std::printf("  [seed %llu] PASS (K=%u, %zu results)\n",
+                            static_cast<unsigned long long>(seed), k,
+                            engine.results.size());
+            }
+        } else {
+            result.seeds_failed++;
+            result.failed_seeds.push_back(seed);
+            if (result.failure_detail.empty()) {
+                char buf[512];
+                std::snprintf(buf, sizeof(buf), "seed %llu (K=%u): %s",
+                              static_cast<unsigned long long>(seed), k,
                               mismatch.c_str());
                 result.failure_detail = buf;
             }
