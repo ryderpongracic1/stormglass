@@ -16,7 +16,16 @@ namespace stormglass {
 struct PartitionedPipelineConfig {
     uint32_t num_workers = 4;         // N worker threads
     Duration allowed_lateness{0};
-    std::size_t queue_capacity = 8192; // per-worker bounded queue depth
+    // Per-worker bounded queue depth, counted in BATCHES: each slot now holds
+    // one Router flush (all WorkerMessages from a single source batch destined
+    // for this worker), not a single message. Worst-case buffered records per
+    // worker = queue_capacity x max-source-batch-size; with the
+    // DeterministicGenerator's default batch_size of 1024 that is 32 x 1024 ~=
+    // 32,768 data records (plus the broadcast control records), reached only
+    // when one key routes an entire batch to a single worker. Kept small
+    // because a slot is now ~1024x the memory it held when it carried one
+    // message: 8192 batch-slots would be ~1000x this bound.
+    std::size_t queue_capacity = 32; // per-worker bounded queue depth, IN BATCHES
 
     // Distributed-checkpoint root. Empty (default) = no checkpointing, in which
     // case every field below is inert and the engine behaves exactly as in

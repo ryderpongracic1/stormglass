@@ -51,7 +51,10 @@ void CreateStaleTmpFile(const std::string& dir, uint64_t offset) {
     int fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         const char* garbage = "PARTIAL_CHECKPOINT_DATA";
-        ::write(fd, garbage, 23);
+        // Best-effort fault injection: even a short write yields a torn .tmp,
+        // which is the point. Ignore the result explicitly (matches the other
+        // write() sites in this file) to satisfy -Wunused-result.
+        [[maybe_unused]] auto wr = ::write(fd, garbage, 23);
         ::close(fd);
     }
 }

@@ -118,7 +118,7 @@ TEST_F(CheckpointTest, CrcValidationCorruptByte) {
     // Seek to middle of file and flip a byte
     ::lseek(fd, 20, SEEK_SET);
     uint8_t byte = 0xFF;
-    ::write(fd, &byte, 1);
+    [[maybe_unused]] auto wr = ::write(fd, &byte, 1);
     ::close(fd);
 
     CheckpointReader reader(dir_);
@@ -160,7 +160,7 @@ TEST_F(CheckpointTest, TmpFileCleanup) {
     // Create a stale .tmp file
     std::string tmp_path = dir_ + "/checkpoint-00000000000000000050.ckpt.tmp";
     int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT, 0644);
-    ::write(fd, "garbage", 7);
+    [[maybe_unused]] auto wr = ::write(fd, "garbage", 7);
     ::close(fd);
 
     // Write a valid checkpoint
@@ -223,7 +223,7 @@ TEST_F(CheckpointTest, FallbackToOlderCheckpoint) {
     ASSERT_GE(fd, 0);
     ::lseek(fd, 10, SEEK_SET);
     uint8_t byte = 0xFF;
-    ::write(fd, &byte, 1);
+    [[maybe_unused]] auto wr = ::write(fd, &byte, 1);
     ::close(fd);
 
     // Reader should fall back to offset 100

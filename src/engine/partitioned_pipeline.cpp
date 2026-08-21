@@ -8,6 +8,7 @@
 #include "sink/memory_sink.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <filesystem>
 #include <string>
@@ -26,12 +27,20 @@ struct EndOfStream {};
 
 using WorkerMessage = std::variant<Record, ControlRecord, EndOfStream>;
 
+// A queue slot carries a BATCH of messages — everything the Router routes to
+// one worker from a single source batch — rather than a single message. This
+// amortizes the per-slot mutex acquire + notify_one (the per-record hand-off
+// was the dominant cost on compute-light workloads) over a whole batch, while
+// preserving per-worker message order exactly: messages are appended in source
+// order within a batch and batches are enqueued strictly FIFO.
+using WorkerBatch = std::vector<WorkerMessage>;
+
 // One shared-nothing worker: owns a bounded input queue, a local sink, and a
 // KeyedProcessor over its subset of keys.
 struct Worker {
     explicit Worker(std::size_t queue_capacity) : queue(queue_capacity) {}
 
-    BoundedQueue<WorkerMessage> queue;
+    BoundedQueue<WorkerBatch> queue;
     // Worker sink: either an internal MemorySink (mem_sink non-null, merged into
     // the caller's sink at join) or a caller-supplied durable sink (mem_sink
     // null, self-persisting). Held by unique_ptr so both cases share one path.
@@ -120,21 +129,27 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
     for (uint32_t i = 0; i < n; ++i) {
         Worker* w = workers[i].get();
         w->thread = std::thread([w] {
-            for (;;) {
-                auto msg = w->queue.Pop();
-                if (!msg.has_value()) break;  // queue closed and drained
-                bool done = false;
-                std::visit([&](auto&& m) {
-                    using T = std::decay_t<decltype(m)>;
-                    if constexpr (std::is_same_v<T, Record>) {
-                        w->processor->ProcessRecord(m);
-                    } else if constexpr (std::is_same_v<T, ControlRecord>) {
-                        w->processor->ProcessControl(m);
-                    } else {  // EndOfStream
-                        done = true;
-                    }
-                }, *msg);
-                if (done) break;
+            bool done = false;
+            while (!done) {
+                auto batch = w->queue.Pop();
+                if (!batch.has_value()) break;  // queue closed and drained
+                // Process messages in the EXACT order the Router appended them
+                // (source order for this worker) — batching changes granularity,
+                // never ordering.
+                for (auto& msg : *batch) {
+                    bool stop = false;
+                    std::visit([&](auto&& m) {
+                        using T = std::decay_t<decltype(m)>;
+                        if constexpr (std::is_same_v<T, Record>) {
+                            w->processor->ProcessRecord(m);
+                        } else if constexpr (std::is_same_v<T, ControlRecord>) {
+                            w->processor->ProcessControl(m);
+                        } else {  // EndOfStream
+                            stop = true;
+                        }
+                    }, msg);
+                    if (stop) { done = true; break; }
+                }
             }
             w->processor->FinalFlush();
         });
@@ -144,27 +159,53 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
     // Runs on its own thread to match the Source -> Router -> Workers topology;
     // the calling thread becomes the Merge stage after join.
     std::thread router([&] {
+        // One pending vector per worker, reused across source batches to avoid
+        // per-batch reallocation; cleared at the start of each source batch.
+        std::vector<WorkerBatch> pending(n);
         while (auto batch = source_->Next()) {
+            for (auto& p : pending) p.clear();
+            // Accumulate this source batch into per-worker vectors in source
+            // order. DATA goes to exactly one worker; CONTROL is appended to
+            // EVERY worker. Because we append in item order, each worker's
+            // vector is the exact record/control interleaving the old
+            // one-Push-per-message path produced for that worker.
             for (auto& item : batch->items) {
                 std::visit([&](auto&& v) {
                     using T = std::decay_t<decltype(v)>;
                     if constexpr (std::is_same_v<T, Record>) {
                         // DATA: exactly one worker, chosen by portable key hash.
                         uint32_t p = PartitionForKey(v.key, n);
-                        workers[p]->queue.Push(WorkerMessage{v});
+                        pending[p].push_back(WorkerMessage{v});
                     } else if constexpr (std::is_same_v<T, ControlRecord>) {
                         // CONTROL: broadcast to ALL workers so every worker
                         // fires against the identical GLOBAL watermark.
                         for (uint32_t p = 0; p < n; ++p) {
-                            workers[p]->queue.Push(WorkerMessage{v});
+                            pending[p].push_back(WorkerMessage{v});
                         }
                     }
                 }, item);
             }
+            // Flush once per source batch: one Push per worker, not per record.
+            // Skip empty vectors so we never enqueue a no-op batch.
+            for (uint32_t p = 0; p < n; ++p) {
+                if (pending[p].empty()) continue;
+                bool pushed = workers[p]->queue.Push(std::move(pending[p]));
+                // The consumer only Close()s after the Router finishes, so Push
+                // can never observe a closed queue here. Assert rather than
+                // silently drop: a dropped batch would corrupt this partition's
+                // result set with no other signal — and result-set integrity is
+                // the whole project thesis.
+                assert(pushed && "worker queue closed before Router finished");
+                (void)pushed;
+            }
         }
-        // Source exhausted: in-band end sentinel to each worker, then close.
+        // Source exhausted: in-band end sentinel (its own final batch) to each
+        // worker AFTER the last data flush, then close.
         for (uint32_t p = 0; p < n; ++p) {
-            workers[p]->queue.Push(WorkerMessage{EndOfStream{}});
+            bool pushed =
+                workers[p]->queue.Push(WorkerBatch{WorkerMessage{EndOfStream{}}});
+            assert(pushed && "worker queue closed before EndOfStream");
+            (void)pushed;
             workers[p]->queue.Close();
         }
     });

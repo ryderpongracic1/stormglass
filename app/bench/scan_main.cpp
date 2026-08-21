@@ -55,7 +55,10 @@ public:
         for (uint64_t i = 0; i < this_batch; ++i) {
             // Round-robin over live_panes_ keys: the first pass creates the
             // panes, every later pass adds to an existing pane (no new panes).
-            char key[24];
+            // Sized for "key-" + up to 20 digits (max uint64) + NUL so
+            // -Wformat-truncation cannot fire, though live_panes_ keeps the
+            // actual value far shorter.
+            char key[32];
             std::snprintf(key, sizeof(key), "key-%08llu",
                           static_cast<unsigned long long>(emitted_ % live_panes_));
             // Event time inside [0, window) keeps every record in one window.
