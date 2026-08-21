@@ -1,6 +1,7 @@
 #include "engine/pipeline.h"
 #include "engine/partitioned_pipeline.h"
 #include "source/generator.h"
+#include "source/source_merge.h"
 #include "sink/memory_sink.h"
 #include "window/tumbling.h"
 #include "window/state.h"
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -309,6 +311,142 @@ static void BenchmarkCheckpointOverhead() {
     std::cout << "\n";
 }
 
+// ===========================================================================
+// Multi-source benchmarks (v3 Phase 4). SourceMerge wraps K DeterministicGenerators
+// behind ONE Source pulled by ONE thread — alignment adds no new concurrency. These
+// measure the PRICE of the merge machinery and of K-way barrier alignment, holding
+// the TOTAL merged record count fixed so only K (and barriers on/off) varies, i.e.
+// the work is constant and the delta is the machinery. All numbers come from this
+// machine; the harness prints median + observed min/max. README reference machine:
+// 4-vCPU shared Intel Xeon 6975P-C. Reproduce with `make bench`.
+// ===========================================================================
+
+namespace {
+
+constexpr uint64_t kMultiSourceTotal = 1'000'000;  // fixed merged DATA-record budget
+
+// Per-source generator config for the multi-source benches. event_time_step is held
+// UNIFORM across sources on purpose: it isolates the SourceMerge machinery (round-
+// robin pull + watermark interception/min-combine + K-way alignment) from windowing
+// divergence, so the K-vs-throughput delta is the merge cost, not a different set of
+// windows firing. (Divergent-rate CORRECTNESS is proven by the differential; this
+// bench measures COST.) Seeds diverge per source so keys/values are not identical
+// duplicate streams, while the event-time rate stays uniform.
+GeneratorConfig MergeSrcConfig(uint64_t records, uint64_t seed) {
+    GeneratorConfig c{};
+    c.seed = seed;
+    c.num_keys = 1000;
+    c.num_records = records;
+    c.event_time_step = 1;
+    c.batch_size = 4096;
+    c.watermark_interval = 500;
+    c.max_disorder = Duration{5000};
+    return c;  // checkpoint_interval 0; barriers controlled per-bench
+}
+
+// Bare single-source Pipeline over `total` records (reference: no SourceMerge).
+double RunBarePipelineOnce(uint64_t total) {
+    auto source = std::make_unique<DeterministicGenerator>(MergeSrcConfig(total, 42));
+    auto assigner = std::make_unique<TumblingAssigner>(Duration{1000});
+    auto sink = std::make_unique<MemorySink>();
+    Pipeline pipeline(std::move(source), std::move(assigner), std::move(sink));
+    auto t0 = Clock::now();
+    auto stats = pipeline.Run();
+    auto t1 = Clock::now();
+    return Throughput(stats.records_processed,
+                      std::chrono::duration<double>(t1 - t0).count());
+}
+
+// SourceMerge of K sources (each ~total/K records) behind a Pipeline.
+// barrier_interval == per-source checkpoint-barrier interval (0 = barriers OFF).
+// checkpoint_dir stays empty, so barriers are dispatched by the pipeline but NOT
+// written — this isolates the K-way ALIGNMENT machinery cost from any fsync.
+double RunSourceMergeOnce(uint32_t k, uint64_t total, uint64_t barrier_interval,
+                          uint64_t* records_out) {
+    SourceMergeConfig mc;
+    mc.merged_batch_size = 4096;
+    mc.checkpoint_interval = barrier_interval;  // per-source default
+    const uint64_t per = total / k;
+    for (uint32_t i = 0; i < k; ++i) {
+        mc.sources.push_back(MergeSrcConfig(per, 42 + i));
+    }
+    auto source = std::make_unique<SourceMerge>(std::move(mc));
+    auto assigner = std::make_unique<TumblingAssigner>(Duration{1000});
+    auto sink = std::make_unique<MemorySink>();
+    Pipeline pipeline(std::move(source), std::move(assigner), std::move(sink));
+    auto t0 = Clock::now();
+    auto stats = pipeline.Run();
+    auto t1 = Clock::now();
+    if (records_out) *records_out = stats.records_processed;
+    return Throughput(stats.records_processed,
+                      std::chrono::duration<double>(t1 - t0).count());
+}
+
+}  // namespace
+
+// Part B.1 — SourceMerge overhead at a fixed total record count (K varies, work
+// doesn't). Bare single-source Pipeline vs SourceMerge K in {1,2,3}.
+static void BenchmarkSourceMergeOverhead() {
+    constexpr int kReps = 7;
+    std::cout << "=== Multi-Source: SourceMerge Overhead (fixed total) ===\n";
+    std::printf("  Workload: %" PRIu64 " merged records total, split across K sources "
+                "(~total/K each), 1000 keys, tumbling 1s, MemorySink, no barriers\n",
+                kMultiSourceTotal);
+    std::cout << "  Hardware: this machine (README reference numbers: 4-vCPU shared Xeon 6975P-C). "
+              << kReps << " reps; median (min-max) M rec/s\n";
+    std::cout << "  (Uniform per-source rate isolates merge machinery from windowing divergence.)\n\n";
+
+    {
+        std::vector<double> v;
+        for (int i = 0; i < kReps; ++i) v.push_back(RunBarePipelineOnce(kMultiSourceTotal));
+        Agg a = Aggregate(v);
+        std::printf("  bare Pipeline (single source, reference) : %6.2f M rec/s  (%.2f - %.2f)\n",
+                    a.median, a.lo, a.hi);
+    }
+    for (uint32_t k : {1u, 2u, 3u}) {
+        std::vector<double> v;
+        uint64_t recs = 0;
+        for (int i = 0; i < kReps; ++i) {
+            v.push_back(RunSourceMergeOnce(k, kMultiSourceTotal, 0, &recs));
+        }
+        Agg a = Aggregate(v);
+        std::printf("  SourceMerge K=%u (%" PRIu64 " merged records)  : %6.2f M rec/s  (%.2f - %.2f)\n",
+                    k, recs, a.median, a.lo, a.hi);
+    }
+    std::cout << "\n";
+}
+
+// Part B.2 — K-way alignment cost: per-source barriers ON at a realistic interval
+// vs OFF, same fixed-total workload. checkpoint_dir empty => alignment machinery
+// only (no fsync). This is the price of Chandy-Lamport alignment itself.
+static void BenchmarkAlignmentCost() {
+    constexpr int kReps = 7;
+    std::cout << "=== Multi-Source: K-way Alignment Cost (barriers ON vs OFF) ===\n";
+    std::printf("  Workload: %" PRIu64 " merged records total, 1000 keys, tumbling 1s, MemorySink; "
+                "checkpoint_dir empty (alignment machinery only, no fsync)\n",
+                kMultiSourceTotal);
+    std::cout << "  Hardware: this machine (README reference numbers: 4-vCPU shared Xeon 6975P-C). "
+              << kReps << " reps; median (min-max) M rec/s\n\n";
+
+    for (uint32_t k : {2u, 3u}) {
+        const uint64_t per = kMultiSourceTotal / k;
+        const uint64_t interval = per / 10;  // ~10 per-source barriers => ~10 aligned epochs
+        std::vector<double> off, on;
+        uint64_t recs = 0;
+        for (int i = 0; i < kReps; ++i) off.push_back(RunSourceMergeOnce(k, kMultiSourceTotal, 0, &recs));
+        for (int i = 0; i < kReps; ++i) on.push_back(RunSourceMergeOnce(k, kMultiSourceTotal, interval, &recs));
+        Agg aoff = Aggregate(off);
+        Agg aon = Aggregate(on);
+        double delta = (aoff.median - aon.median) / aoff.median * 100.0;
+        std::printf("  K=%u  barriers OFF  : %6.2f M rec/s  (%.2f - %.2f)\n",
+                    k, aoff.median, aoff.lo, aoff.hi);
+        std::printf("  K=%u  barriers ON   : %6.2f M rec/s  (%.2f - %.2f)  "
+                    "[per-source interval %" PRIu64 ", merged stride %" PRIu64 ", ~10 aligned epochs]\n",
+                    k, aon.median, aon.lo, aon.hi, interval, k * interval);
+        std::printf("  K=%u  alignment cost: %+.1f%% throughput vs OFF\n\n", k, -delta);
+    }
+}
+
 int main() {
     std::cout << "=== Pipeline Throughput ===\n";
     BenchmarkPipeline(100'000);
@@ -319,5 +457,7 @@ int main() {
     BenchmarkCheckpoint();
     BenchmarkScalingCurve();
     BenchmarkCheckpointOverhead();
+    BenchmarkSourceMergeOverhead();
+    BenchmarkAlignmentCost();
     return 0;
 }
