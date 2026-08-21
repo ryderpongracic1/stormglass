@@ -4,6 +4,7 @@
 #include "checkpoint/distributed_checkpoint.h"
 #include "source/generator.h"
 #include "source/stopping_source.h"
+#include "source/source_merge.h"
 #include "sink/memory_sink.h"
 #include "sink/durable_file_sink.h"
 #include "window/tumbling.h"
@@ -776,6 +777,391 @@ PartitionedRealKillResult RunPartitionedRealKillNemesis(
                                .allowed_lateness = config.allowed_lateness});
     DeterministicGenerator oracle_gen(MakePartGenConfig(config));
     while (auto batch = oracle_gen.Next()) {
+        for (auto& item : batch->items) {
+            if (auto* r = std::get_if<Record>(&item)) {
+                oracle.AddRecord(*r);
+            } else if (auto* c = std::get_if<ControlRecord>(&item)) {
+                if (c->type == ControlType::kWatermark) {
+                    oracle.AdvanceWatermark(c->watermark);
+                }
+            }
+        }
+    }
+    auto oracle_results = oracle.ComputeResults();
+    result.oracle_results = oracle_results.size();
+
+    result.missing_results = 0;
+    for (const auto& r : oracle_results) {
+        ResultKey rk{r.key, r.window.start.time_since_epoch().count(),
+                     r.window.end.time_since_epoch().count()};
+        auto it = combined.find(rk);
+        if (it == combined.end()) {
+            result.missing_results++;
+            if (result.failure_detail.empty()) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "Missing result: key=%s window=[%" PRId64 ",%" PRId64 ")",
+                    r.key.c_str(), rk.window_start, rk.window_end);
+                result.failure_detail = buf;
+            }
+        } else if (it->second.sum != r.result.value ||
+                   it->second.count != r.result.count) {
+            result.missing_results++;
+            if (result.failure_detail.empty()) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "Value mismatch key=%s window=[%" PRId64 ",%" PRId64 "): "
+                    "oracle sum=%" PRId64 " count=%" PRIu64 ", got sum=%" PRId64 " count=%" PRIu64 "",
+                    r.key.c_str(), rk.window_start, rk.window_end,
+                    r.result.value, r.result.count,
+                    it->second.sum, it->second.count);
+                result.failure_detail = buf;
+            }
+        }
+    }
+
+    result.passed = (result.missing_results == 0) && result.failure_detail.empty();
+
+    RemoveDir(workdir);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Mid-ALIGNMENT crash nemesis (v3 Phase 3): fork() a child running the real
+// Pipeline over a SourceMerge with divergent per-source barrier cadences, SIGKILL
+// it WHILE K-way alignment is in progress, restore, and verify fallback to the
+// last COMPLETE aligned checkpoint + at-least-once.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A Source decorator that forwards to a SourceMerge and, after every pull, writes
+// the merge's live ALIGNMENT state to a marker file so the parent can detect a
+// mid-alignment moment. Uses the SourceMerge Phase-3 introspection accessors —
+// SourceMerge itself is unchanged and single-threaded. The pipeline drives this
+// exactly like any other Source.
+class AlignmentProbeSource : public Source {
+public:
+    AlignmentProbeSource(SourceMergeConfig cfg, std::string marker_path, std::size_t k)
+        : merge_(std::move(cfg)), marker_(std::move(marker_path)), k_(k) {}
+
+    std::optional<Batch> Next() override {
+        auto b = merge_.Next();
+        WriteMarker();
+        return b;
+    }
+    void Seek(uint64_t offset) override { merge_.Seek(offset); }
+    [[nodiscard]] uint64_t CurrentOffset() const override { return merge_.CurrentOffset(); }
+
+private:
+    void WriteMarker() {
+        uint32_t delivered = 0;
+        const uint64_t closed = merge_.EpochsClosed();
+        for (std::size_t i = 0; i < k_; ++i) {
+            if (merge_.BarriersSeen(i) > closed) ++delivered;  // blocked at the open epoch
+        }
+        std::string tmp = marker_ + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "w");
+        if (!f) return;
+        if (delivered > 0 && delivered < k_) {
+            // PARTIAL: some (not all) channels delivered the open epoch's barrier.
+            std::fprintf(f, "PARTIAL %" PRIu64 " %u %u %" PRIu64 "\n",
+                         closed + 1, delivered, static_cast<unsigned>(k_),
+                         merge_.CurrentOffset());
+        } else {
+            std::fprintf(f, "NONE\n");
+        }
+        std::fclose(f);
+        std::rename(tmp.c_str(), marker_.c_str());  // atomic swap for the reader
+    }
+
+    SourceMerge merge_;
+    std::string marker_;
+    std::size_t k_;
+};
+
+struct MarkerState {
+    bool partial = false;
+    uint64_t epoch = 0;
+    uint32_t delivered = 0;
+    uint32_t k = 0;
+    uint64_t offset = 0;
+};
+
+MarkerState ReadMarker(const std::string& path) {
+    MarkerState m;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return m;
+    char tag[16] = {0};
+    if (std::fscanf(f, "%15s", tag) == 1 && std::strcmp(tag, "PARTIAL") == 0) {
+        unsigned long long epoch = 0, offset = 0;
+        unsigned d = 0, k = 0;
+        if (std::fscanf(f, "%llu %u %u %llu", &epoch, &d, &k, &offset) == 4) {
+            m.partial = true;
+            m.epoch = epoch;
+            m.delivered = d;
+            m.k = k;
+            m.offset = offset;
+        }
+    }
+    std::fclose(f);
+    return m;
+}
+
+// Highest COMPLETE single-file checkpoint offset on disk (.ckpt, excluding .tmp),
+// parsed from the "checkpoint-<offset>.ckpt" filename.
+std::optional<uint64_t> HighestCompleteSingleCheckpoint(const std::string& dir) {
+    DIR* d = ::opendir(dir.c_str());
+    if (!d) return std::nullopt;
+    std::optional<uint64_t> best;
+    struct dirent* entry;
+    while ((entry = ::readdir(d)) != nullptr) {
+        std::string name = entry->d_name;
+        if (!EndsWith(name, ".ckpt")) continue;  // ".ckpt.tmp" excluded
+        auto dash = name.find('-');
+        if (dash == std::string::npos) continue;
+        uint64_t off = std::strtoull(name.c_str() + dash + 1, nullptr, 10);
+        if (!best || off > *best) best = off;
+    }
+    ::closedir(d);
+    return best;
+}
+
+// The divergent-cadence merge config: two sources, fast + slow barrier intervals.
+SourceMergeConfig MakeAlignmentMergeConfig(const AlignmentKillConfig& config) {
+    SourceMergeConfig mc;
+    mc.merged_batch_size = 100;   // < S so a batch stays within ~one epoch
+    mc.checkpoint_interval = 0;   // per-source intervals drive the barriers
+
+    GeneratorConfig fast{};
+    fast.seed = config.seed;
+    fast.num_keys = config.num_keys;
+    fast.num_records = config.num_records;
+    fast.event_time_step = 2;     // faster event-time
+    fast.max_disorder = config.max_disorder;
+    fast.batch_size = 512;
+    fast.watermark_interval = 100;
+    fast.checkpoint_interval = config.interval_fast;
+
+    GeneratorConfig slow{};
+    slow.seed = config.seed + 7919u;
+    slow.num_keys = config.num_keys;
+    slow.num_records = config.num_records;
+    slow.event_time_step = 1;     // slower event-time (pins the MIN)
+    slow.max_disorder = config.max_disorder;
+    slow.batch_size = 512;
+    slow.watermark_interval = 100;
+    slow.checkpoint_interval = config.interval_slow;
+
+    mc.sources = {fast, slow};
+    return mc;
+}
+
+void RunAlignmentKillChild(const AlignmentKillConfig& config,
+                           const std::string& ckpt_dir, const std::string& sink_path,
+                           const std::string& marker_path,
+                           const std::string& sentinel_path) {
+    auto mc = MakeAlignmentMergeConfig(config);
+    auto source = std::make_unique<AlignmentProbeSource>(mc, marker_path,
+                                                         mc.sources.size());
+    auto sink = std::make_unique<DurableFileSink>(sink_path);
+    auto assigner = std::make_unique<TumblingAssigner>(config.window_size);
+
+    PipelineConfig pconfig{};
+    pconfig.checkpoint_dir = ckpt_dir;
+    // Only used as the "checkpointing enabled" flag; the merged barriers drive
+    // WHEN checkpoints are written.
+    pconfig.checkpoint_interval = config.interval_fast + config.interval_slow;
+
+    Pipeline pipeline(std::move(source), std::move(assigner), std::move(sink), pconfig);
+    pipeline.Run();  // includes final flush
+
+    int fd = ::open(sentinel_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        const char done = 'D';
+        [[maybe_unused]] auto n = ::write(fd, &done, 1);
+        ::fsync(fd);
+        ::close(fd);
+    }
+}
+
+}  // namespace
+
+AlignmentKillResult RunAlignmentKillNemesis(const AlignmentKillConfig& config) {
+    AlignmentKillResult result;
+    const uint64_t S = config.interval_fast + config.interval_slow;
+    result.merged_stride = S;
+    result.num_channels = 2;
+
+    std::string workdir, ckpt_dir, sink_pre, sink_post, marker, sentinel;
+    bool captured = false;
+    uint64_t captured_complete = 0;  // highest complete (aligned) checkpoint AT KILL time
+
+    for (uint32_t attempt = 1; attempt <= config.max_attempts; ++attempt) {
+        result.attempts = attempt;
+
+        workdir = CreateTempDir();
+        if (workdir.empty()) {
+            result.failure_detail = "Failed to create temp dir";
+            return result;
+        }
+        ckpt_dir = workdir + "/ckpt";
+        std::filesystem::create_directory(ckpt_dir);
+        sink_pre = workdir + "/pre.bin";
+        sink_post = workdir + "/post.bin";
+        marker = workdir + "/align.marker";
+        sentinel = workdir + "/done";
+
+        pid_t pid = ::fork();
+        if (pid < 0) {
+            RemoveDir(workdir);
+            result.failure_detail = "fork() failed";
+            return result;
+        }
+        if (pid == 0) {
+            RunAlignmentKillChild(config, ckpt_dir, sink_pre, marker, sentinel);
+            ::_exit(0);
+        }
+
+        // Parent: arm once `target_checkpoint` COMPLETE merged checkpoints exist,
+        // then SIGKILL the instant a PARTIAL alignment (some channels delivered
+        // the open barrier, others not) is observed for an epoch above the
+        // fallback. Freeze-verify-kill so the persisted state cannot change.
+        bool killed = false, child_reaped = false, armed = false;
+        int status = 0;
+        MarkerState kill_marker;
+        while (true) {
+            pid_t w = ::waitpid(pid, &status, WNOHANG);
+            if (w == pid) { child_reaped = true; break; }
+
+            if (!armed) {
+                if (CountCompletedCheckpoints(ckpt_dir) >= config.target_checkpoint) {
+                    armed = true;
+                } else {
+                    SleepMicros(50);
+                    continue;
+                }
+            }
+            MarkerState ms = ReadMarker(marker);
+            // Mid-alignment for an epoch strictly above at least one complete
+            // checkpoint (epoch-1 >= 1) is a genuine partial cut we can kill on.
+            if (ms.partial && ms.epoch >= 2 && ms.delivered >= 1 && ms.delivered < ms.k) {
+                ::kill(pid, SIGSTOP);
+                MarkerState m2 = ReadMarker(marker);
+                if (m2.partial && m2.delivered >= 1 && m2.delivered < m2.k &&
+                    !PathExists(sentinel)) {
+                    ::kill(pid, SIGKILL);
+                    killed = true;
+                    kill_marker = m2;
+                    break;
+                }
+                ::kill(pid, SIGCONT);
+            }
+        }
+
+        if (!child_reaped) {
+            ::waitpid(pid, &status, 0);
+        }
+
+        bool by_sigkill = killed && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+        bool sentinel_present = PathExists(sentinel);
+
+        bool genuine = by_sigkill && !sentinel_present && kill_marker.partial;
+        if (!genuine) {
+            RemoveDir(workdir);
+            continue;  // retry with a fresh fork
+        }
+
+        result.killed_by_sigkill = by_sigkill;
+        result.final_flush_completed = sentinel_present;
+        result.alignment_partial_at_kill = kill_marker.partial;
+        result.epoch_in_progress = kill_marker.epoch;
+        result.channels_delivered = kill_marker.delivered;
+        result.num_channels = kill_marker.k;
+        // Snapshot the highest COMPLETE (fully-aligned) checkpoint NOW, before the
+        // restore run writes fresh checkpoints into the same directory.
+        if (auto hc = HighestCompleteSingleCheckpoint(ckpt_dir)) captured_complete = *hc;
+        captured = true;
+        break;
+    }
+
+    if (!captured) {
+        result.failure_detail =
+            "Could not capture a genuine mid-alignment crash within max_attempts";
+        if (!workdir.empty()) RemoveDir(workdir);
+        return result;
+    }
+
+    // --- Restart: fresh pipeline restores from the last COMPLETE (fully-aligned)
+    //     merged checkpoint and drains to completion into a second durable sink.
+    {
+        auto mc = MakeAlignmentMergeConfig(config);
+        auto source = std::make_unique<SourceMerge>(mc);  // no probe needed on restore
+        auto sink = std::make_unique<DurableFileSink>(sink_post);
+        auto assigner = std::make_unique<TumblingAssigner>(config.window_size);
+
+        PipelineConfig pconfig{};
+        pconfig.checkpoint_dir = ckpt_dir;
+        pconfig.checkpoint_interval = S;
+
+        Pipeline pipeline(std::move(source), std::move(assigner), std::move(sink), pconfig);
+        auto stats = pipeline.Run();
+        result.restored_offset = stats.records_replayed;
+    }
+
+    // Restore MUST have used a COMPLETE aligned cut: a positive multiple of the
+    // merged stride S, matching the highest complete checkpoint captured AT KILL
+    // time (the restore run itself writes fresh checkpoints, so we compare against
+    // the pre-restore snapshot), and strictly below the mid-alignment epoch's cut
+    // (its merged barrier was never emitted, so no checkpoint for it can exist).
+    if (result.restored_offset == 0 || result.restored_offset % S != 0) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "restore offset %" PRIu64 " is not a positive multiple of the merged "
+            "stride %" PRIu64 " (not a fully-aligned cut)",
+            result.restored_offset, S);
+        result.failure_detail = buf;
+    } else if (result.restored_offset != captured_complete) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "restore offset %" PRIu64 " != highest complete checkpoint at kill %" PRIu64 "",
+            result.restored_offset, captured_complete);
+        result.failure_detail = buf;
+    } else if (result.restored_offset >= result.epoch_in_progress * S) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "restore offset %" PRIu64 " did not fall back below the mid-alignment "
+            "epoch cut %" PRIu64 "",
+            result.restored_offset, result.epoch_in_progress * S);
+        result.failure_detail = buf;
+    }
+
+    // --- Union durable pre-crash + post-restore output ---
+    auto pre = DurableFileSink::ReadAll(sink_pre);
+    auto post = DurableFileSink::ReadAll(sink_post);
+    result.pre_crash_emits = pre.size();
+    result.post_restore_emits = post.size();
+
+    ResultMap combined;
+    auto absorb = [&combined](const std::vector<WindowResult>& results) {
+        for (const auto& r : results) {
+            ResultKey rk{r.key, r.window.start.time_since_epoch().count(),
+                         r.window.end.time_since_epoch().count()};
+            combined[rk] = ResultValue{r.result.value, r.result.count};
+        }
+    };
+    absorb(pre);
+    absorb(post);
+    result.union_results = combined.size();
+    result.duplicates = (pre.size() + post.size()) - combined.size();
+
+    // --- Oracle over the full MERGED stream (a fresh SourceMerge with the same
+    //     config), fed records + min-combined watermarks. Barriers do not affect
+    //     aggregation, so the oracle stays byte-unmodified. ---
+    Oracle oracle(OracleConfig{.window_size = config.window_size,
+                               .allowed_lateness = Duration{0}});
+    SourceMerge oracle_src(MakeAlignmentMergeConfig(config));
+    while (auto batch = oracle_src.Next()) {
         for (auto& item : batch->items) {
             if (auto* r = std::get_if<Record>(&item)) {
                 oracle.AddRecord(*r);

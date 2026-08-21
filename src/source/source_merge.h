@@ -102,11 +102,22 @@ private:
 struct SourceMergeConfig {
     std::vector<GeneratorConfig> sources;
 
-    // Records between merged-stream checkpoint barriers (0 = no barriers).
-    // SourceMerge is the SINGLE barrier origin in Phase 1: it stamps each barrier
-    // with the merged offset, exactly like a single generator does today. Any
-    // checkpoint_interval on the wrapped source configs is IGNORED (forced to 0)
-    // — the merged stream owns barriers.
+    // Per-source checkpoint-barrier interval, applied as a DEFAULT to every
+    // wrapped source whose own GeneratorConfig::checkpoint_interval is 0. A source
+    // that sets its own non-zero checkpoint_interval keeps it, so channels can
+    // carry DIVERGENT barrier cadences. 0 here AND 0 on a source == that source
+    // emits no barriers (and the merged stream has none).
+    //
+    // v3 Phase 3: SourceMerge is NO LONGER a single barrier origin. Each wrapped
+    // source emits its OWN kCheckpointBarrier at its own record offsets, and
+    // SourceMerge performs real K-way Chandy-Lamport ALIGNMENT: when barrier N
+    // arrives early on a channel, that channel is BLOCKED (its subsequent records
+    // buffered — not pulled past the barrier) until barrier N has arrived on every
+    // ACTIVE channel; only then is ONE merged barrier — stamped with the merged
+    // offset of the aligned cut — emitted downstream and all channels unblocked.
+    // For K == 1 alignment is trivially satisfied, so a single source with interval
+    // N yields merged barriers at offsets N, 2N, … exactly as the pre-Phase-3
+    // single-origin stamp did.
     uint64_t checkpoint_interval = 0;
 
     // Data records assembled per merged Next() batch. Matches the generator's
@@ -139,8 +150,15 @@ struct SourceMergeConfig {
 ///     re-seeds ALL wrapped sources and replays to O, so a restore replays the
 ///     identical merged sequence (O(O), the same documented replay cost the
 ///     single generator's Seek pays).
-///   * Barriers: SourceMerge is the single barrier origin, stamping each with the
-///     merged offset. REAL K-way per-source barrier ALIGNMENT is Phase 3.
+///   * Barriers (v3 Phase 3): each wrapped source emits its OWN barriers; Source-
+///     Merge aligns them K-way (Chandy-Lamport). When barrier N arrives early on a
+///     channel, that channel is BLOCKED (its records buffered — left unpulled — not
+///     advanced past the barrier) until barrier N has arrived on every ACTIVE
+///     channel; then ONE merged barrier, stamped with the aligned cut's merged
+///     offset, is emitted downstream and all channels unblock. An IDLE channel
+///     (excluded from the watermark MIN) is likewise excluded from the alignment
+///     set, so a quiet channel can never deadlock alignment; on resume it rejoins
+///     the set and catches up. Downstream consumes the merged stream unchanged.
 class SourceMerge : public Source {
 public:
     explicit SourceMerge(SourceMergeConfig config);
@@ -156,6 +174,21 @@ public:
     /// Whether wrapped source `i` is currently marked IDLE (excluded from the
     /// MIN). Exposed for the Phase-2 idle unit tests.
     [[nodiscard]] bool IsSourceIdle(std::size_t i) const { return states_[i].idle; }
+
+    /// --- v3 Phase 3 alignment introspection (for the direct alignment tests) ---
+    /// Number of merged barriers emitted so far == fully-aligned epochs closed.
+    [[nodiscard]] uint64_t EpochsClosed() const { return epoch_closed_; }
+    /// How many per-source barriers wrapped source `i` has delivered into the
+    /// alignment machinery.
+    [[nodiscard]] uint64_t BarriersSeen(std::size_t i) const {
+        return states_[i].barriers_seen;
+    }
+    /// Whether source `i` is currently BLOCKED at a barrier for the open epoch:
+    /// it delivered its barrier and is held (records buffered) until every active
+    /// channel aligns and the epoch closes.
+    [[nodiscard]] bool IsChannelBlocked(std::size_t i) const {
+        return states_[i].barriers_seen > epoch_closed_;
+    }
 
 private:
     enum class StepResult { kProduced, kExhausted };
@@ -174,6 +207,9 @@ private:
         uint64_t data_pulled = 0;           // this source's own data-record index
         uint64_t consecutive_empty = 0;     // consecutive empty pulls (resets on any output)
         bool idle = false;                  // excluded from the MIN (idle_timeout tripped)
+
+        // --- v3 Phase 3 alignment state ---
+        uint64_t barriers_seen = 0;         // per-source barriers delivered into alignment
     };
 
     void ResetState();
@@ -181,13 +217,28 @@ private:
     StepResult ProduceOneMergedStep(Batch& out, std::size_t& data_in_batch);
     [[nodiscard]] bool AllExhausted() const;
 
+    /// v3 Phase 3: if every ACTIVE (non-idle, non-exhausted) channel has delivered
+    /// its barrier for the open epoch, close it — append ONE merged barrier stamped
+    /// with the current merged offset and advance epoch_closed_ (which unblocks the
+    /// channels that were held at this barrier). No-op otherwise. Called after a
+    /// per-source barrier arrives, after a channel goes idle, and after a channel
+    /// exhausts — the three events that can complete an alignment.
+    void MaybeCloseEpoch(Batch& out);
+
+    /// The effective per-source barrier interval for `src`: its own if non-zero,
+    /// else the merged-config default. 0 == that source emits no barriers.
+    [[nodiscard]] uint64_t EffectiveInterval(const GeneratorConfig& src) const {
+        return src.checkpoint_interval > 0 ? src.checkpoint_interval
+                                           : config_.checkpoint_interval;
+    }
+
     SourceMergeConfig config_;
     std::vector<SourceState> states_;
     MinWatermarkCombiner combiner_;
 
     std::size_t rr_ = 0;                 // round-robin cursor over sources
     uint64_t merged_offset_ = 0;         // count of merged DATA records emitted
-    uint64_t records_since_checkpoint_ = 0;
+    uint64_t epoch_closed_ = 0;          // merged barriers (fully-aligned epochs) emitted
 };
 
 } // namespace stormglass

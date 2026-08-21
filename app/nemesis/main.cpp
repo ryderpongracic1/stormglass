@@ -17,6 +17,8 @@ void PrintUsage() {
         "  --phase <mid-checkpoint|mid-emission|between>  in-process phase (default: between)\n"
         "  --real-kill            Headline mode: genuine fork() + SIGKILL crash\n"
         "  --partitioned          Partitioned engine: fork+SIGKILL at a TORN global checkpoint\n"
+        "  --alignment-kill       v3 Phase 3: fork+SIGKILL WHILE K-way barrier alignment\n"
+        "                         is in progress; restore from last complete aligned checkpoint\n"
         "  --workers N            Worker count for --partitioned (default: 4)\n"
         "  --real-phase <between|mid-checkpoint>  real-kill point (default: between)\n"
         "  --keys N               Keys per run, real-kill only (default: 50)\n"
@@ -193,6 +195,58 @@ int RunPartitionedRealKill(uint64_t num_seeds, uint64_t num_records,
     return (passed == num_seeds && total_missing == 0) ? 0 : 1;
 }
 
+int RunAlignmentKill(uint64_t num_seeds, bool verbose) {
+    std::printf("Nemesis test (MID-ALIGNMENT fork+SIGKILL, v3 Phase 3): "
+                "%" PRIu64 " runs\n", num_seeds);
+
+    uint64_t passed = 0, total_missing = 0, total_duplicates = 0;
+    uint64_t kills = 0, partials = 0, clean_flushes = 0;
+
+    for (uint64_t i = 0; i < num_seeds; ++i) {
+        AlignmentKillConfig config{};
+        config.seed = 42 + i;
+
+        auto result = RunAlignmentKillNemesis(config);
+
+        if (result.passed) ++passed;
+        if (result.killed_by_sigkill) ++kills;
+        if (result.alignment_partial_at_kill) ++partials;
+        if (result.final_flush_completed) ++clean_flushes;
+        total_missing += result.missing_results;
+        total_duplicates += result.duplicates;
+
+        if (verbose) {
+            std::printf("  [run %" PRIu64 "/%" PRIu64 "] %s killed=%s flush=%s "
+                        "partial=%s epoch=%" PRIu64 " delivered=%u/%u stride=%" PRIu64 " "
+                        "restored@%" PRIu64 " pre=%" PRIu64 " post=%" PRIu64 " union=%" PRIu64 " "
+                        "oracle=%" PRIu64 " missing=%" PRIu64 " dup=%" PRIu64 " attempts=%u",
+                        i + 1, num_seeds, result.passed ? "PASS" : "FAIL",
+                        result.killed_by_sigkill ? "SIGKILL" : "no",
+                        result.final_flush_completed ? "yes" : "no",
+                        result.alignment_partial_at_kill ? "yes" : "no",
+                        result.epoch_in_progress, result.channels_delivered,
+                        result.num_channels, result.merged_stride,
+                        result.restored_offset, result.pre_crash_emits,
+                        result.post_restore_emits, result.union_results,
+                        result.oracle_results, result.missing_results,
+                        result.duplicates, result.attempts);
+            if (!result.passed && !result.failure_detail.empty()) {
+                std::printf(" — %s", result.failure_detail.c_str());
+            }
+            std::printf("\n");
+        }
+    }
+
+    std::printf("\nResult: %" PRIu64 "/%" PRIu64 " passed, %" PRIu64 " missing across all runs\n",
+                passed, num_seeds, total_missing);
+    std::printf("Kill evidence: %" PRIu64 "/%" PRIu64 " SIGKILL, %" PRIu64 " partial-alignment "
+                "captures, %" PRIu64 " clean-flush escapes\n",
+                kills, num_seeds, partials, clean_flushes);
+    std::printf("Total duplicates: %" PRIu64 " (at-least-once; restore falls back to the "
+                "last fully-aligned checkpoint)\n", total_duplicates);
+    return (passed == num_seeds && total_missing == 0) ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -207,6 +261,7 @@ int main(int argc, char* argv[]) {
     bool records_set = false;
     bool interval_set = false;
     bool partitioned = false;
+    bool alignment_kill = false;
     uint32_t num_workers = 4;
     DisorderMode disorder_mode = DisorderMode::kBounded;
     double late_fraction = 0.0;
@@ -240,6 +295,8 @@ int main(int argc, char* argv[]) {
             real_kill = true;
         } else if (std::strcmp(argv[i], "--partitioned") == 0) {
             partitioned = true;
+        } else if (std::strcmp(argv[i], "--alignment-kill") == 0) {
+            alignment_kill = true;
         } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
             num_workers = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--real-phase") == 0 && i + 1 < argc) {
@@ -278,6 +335,10 @@ int main(int argc, char* argv[]) {
             PrintUsage();
             return 1;
         }
+    }
+
+    if (alignment_kill) {
+        return RunAlignmentKill(num_seeds, verbose);
     }
 
     if (partitioned) {

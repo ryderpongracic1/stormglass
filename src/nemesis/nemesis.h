@@ -171,4 +171,70 @@ struct PartitionedRealKillResult {
 PartitionedRealKillResult RunPartitionedRealKillNemesis(
     const PartitionedRealKillConfig& config);
 
+// ---------------------------------------------------------------------------
+// Mid-ALIGNMENT crash nemesis: fork() + SIGKILL while K-way barrier alignment
+// is in progress (v3 Phase 3)
+// ---------------------------------------------------------------------------
+//
+// The child runs the real single-threaded Pipeline over a SourceMerge of K
+// sources with DIVERGENT per-source barrier cadences (interval_fast << interval_
+// slow), so the fast channel reaches its barrier N early and is BLOCKED for most
+// of each epoch while the slow channel catches up — a wide, easy-to-hit mid-
+// alignment window. A probe wrapper writes the SourceMerge's live alignment state
+// to a marker file after every pull. The parent arms once `target_checkpoint`
+// COMPLETE merged checkpoints exist (a solid fallback), then SIGSTOPs the child
+// the instant the marker shows a PARTIAL alignment (some channels delivered
+// barrier N, others not), re-verifies while frozen, and SIGKILLs — so the crash
+// is provably mid-alignment. Restart, restore, and verify: (a) restore fell back
+// to the last COMPLETE (fully-aligned) checkpoint — a multiple of the merged
+// stride S = sum of per-source intervals, strictly below the mid-alignment epoch
+// — never a partial cut; and (b) at-least-once holds (union of pre-crash durable
+// output and post-restore output covers the oracle over the merged stream, 0
+// missing). A capture-retry loop mirrors the other real-kill harnesses.
+//
+// L == 0 / bounded here, so DurableFileSink's per-emit fsync does NOT balloon
+// (no lateness re-fire), and the workload stays small.
+
+struct AlignmentKillConfig {
+    uint64_t seed = 42;
+    uint64_t num_records = 3000;       // PER SOURCE (merged ~ K * this; kept small)
+    uint32_t num_keys = 20;
+    Duration window_size{1000};
+    Duration max_disorder{200};
+    // Divergent per-source barrier intervals so alignment blocks the fast channel
+    // for most of each epoch. S (merged stride per fully-aligned epoch) == fast +
+    // slow.
+    uint64_t interval_fast = 50;
+    uint64_t interval_slow = 450;
+    uint32_t target_checkpoint = 2;    // arm after this many COMPLETE merged checkpoints
+    uint32_t max_attempts = 400;
+};
+
+struct AlignmentKillResult {
+    bool passed = false;
+    uint32_t attempts = 0;
+
+    // Evidence the crash was real AND mid-alignment.
+    bool killed_by_sigkill = false;        // child terminated by SIGKILL
+    bool final_flush_completed = false;    // child sentinel present (should be false)
+    bool alignment_partial_at_kill = false;// some (but not all) channels aligned at kill
+    uint64_t epoch_in_progress = 0;        // the open (mid-alignment) epoch at kill
+    uint32_t channels_delivered = 0;       // channels that had delivered the open barrier
+    uint32_t num_channels = 0;
+    uint64_t merged_stride = 0;            // S = sum of per-source barrier intervals
+
+    // Verification.
+    uint64_t restored_offset = 0;          // COMPLETE (aligned) checkpoint restore used
+    uint64_t pre_crash_emits = 0;
+    uint64_t post_restore_emits = 0;
+    uint64_t union_results = 0;
+    uint64_t oracle_results = 0;
+    uint64_t missing_results = 0;          // MUST be 0 for at-least-once
+    uint64_t duplicates = 0;
+
+    std::string failure_detail;
+};
+
+AlignmentKillResult RunAlignmentKillNemesis(const AlignmentKillConfig& config);
+
 } // namespace stormglass

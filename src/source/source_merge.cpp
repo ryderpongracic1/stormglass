@@ -18,10 +18,11 @@ void SourceMerge::ResetState() {
     for (const auto& src : config_.sources) {
         SourceState st;
         st.config = src;
-        // SourceMerge owns barriers on the merged stream — the wrapped sources
-        // must NOT emit their own (they would carry per-source offsets that mean
-        // nothing on the merged stream).
-        st.config.checkpoint_interval = 0;
+        // v3 Phase 3: wrapped sources emit their OWN barriers now (Phase 1/2 forced
+        // this to 0). EffectiveInterval picks the source's own checkpoint_interval,
+        // else the merged-config default; SourceMerge aligns the resulting per-source
+        // barriers K-way. 0 (both) == this source emits no barriers.
+        st.config.checkpoint_interval = EffectiveInterval(src);
         st.gen = std::make_unique<DeterministicGenerator>(st.config);
         // Idle spans are modeled by SourceMerge (it pauses the wrapped generator
         // for the span); the generator itself ignores them. Copy them out so the
@@ -32,7 +33,7 @@ void SourceMerge::ResetState() {
     combiner_ = MinWatermarkCombiner(std::max<std::size_t>(1, config_.sources.size()));
     rr_ = 0;
     merged_offset_ = 0;
-    records_since_checkpoint_ = 0;
+    epoch_closed_ = 0;
 }
 
 bool SourceMerge::PullNextItem(std::size_t i, BatchItem& out) {
@@ -60,6 +61,13 @@ SourceMerge::StepResult SourceMerge::ProduceOneMergedStep(Batch& out,
         const std::size_t i = (rr_ + attempt) % k;
         SourceState& st = states_[i];
         if (st.exhausted) continue;
+
+        // v3 Phase 3 alignment HOLD: a channel that has delivered its barrier for
+        // the OPEN epoch is BLOCKED. Its records stay buffered (unpulled in st.buf,
+        // st.cursor not advanced past the barrier) and it is skipped in the round-
+        // robin until every active channel aligns and the epoch closes. This is the
+        // Chandy-Lamport "block the early channel" step.
+        if (IsChannelBlocked(i)) continue;
 
         // --- v3 Phase 2 idle-span modeling ---
         // A gap begins when the source has pulled exactly `start_offset` data
@@ -95,13 +103,23 @@ SourceMerge::StepResult SourceMerge::ProduceOneMergedStep(Batch& out,
                         .checkpoint_offset = merged_offset_,
                     });
                 }
+                // Excluding the quiet channel from the MIN ALSO excludes it from the
+                // barrier ALIGNMENT set. If every remaining active channel already
+                // delivered its barrier for the open epoch, the epoch can now close
+                // WITHOUT this channel — this is precisely what stops a quiet channel
+                // from deadlocking alignment (see MaybeCloseEpoch).
+                MaybeCloseEpoch(out);
             }
             return StepResult::kProduced;  // serviced a turn; stream still live
         }
 
         BatchItem item;
         if (!PullNextItem(i, item)) {
-            continue;  // this source just exhausted; try the next one
+            // This source just exhausted. Remove it from the alignment set: the
+            // remaining active channels may now be able to close the open epoch
+            // (a dead channel can never deliver another barrier).
+            MaybeCloseEpoch(out);
+            continue;  // try the next source
         }
         // Advance the round-robin cursor PAST the source we pulled from, so the
         // interleaving is a strict, reproducible rotation over live sources.
@@ -129,30 +147,10 @@ SourceMerge::StepResult SourceMerge::ProduceOneMergedStep(Batch& out,
                 ++merged_offset_;
                 ++data_in_batch;
                 ++st.data_pulled;
-
-                // Merged checkpoint barrier, stamped with the merged offset.
-                // Because merged items are produced in order, everything at or
-                // below this offset has been emitted when a downstream pipeline
-                // dequeues the barrier and nothing after it has — the same
-                // degenerate Chandy-Lamport property the single source relies on.
-                //
-                // PHASE 3 HOOK: real multi-source recovery needs K-way barrier
-                // ALIGNMENT — inject a per-source barrier into each channel, hold
-                // each channel at its barrier until all K have arrived, then
-                // snapshot the aligned cut. That replaces this single-origin
-                // stamp right here. Phase 2 keeps the single origin intact and
-                // idleness does NOT touch barriers.
-                if (config_.checkpoint_interval > 0) {
-                    ++records_since_checkpoint_;
-                    if (records_since_checkpoint_ >= config_.checkpoint_interval) {
-                        records_since_checkpoint_ = 0;
-                        out.items.emplace_back(ControlRecord{
-                            .type = ControlType::kCheckpointBarrier,
-                            .watermark = Timestamp::min(),
-                            .checkpoint_offset = merged_offset_,
-                        });
-                    }
-                }
+                // v3 Phase 3: the merged barrier is NO LONGER stamped here by a
+                // merged record count. It is produced by MaybeCloseEpoch when the
+                // per-source barriers ALIGN (see the kCheckpointBarrier branch),
+                // so the merged barrier's offset is the aligned cut, not a count.
             } else {  // ControlRecord from a wrapped source
                 const ControlRecord& c = v;
                 if (c.type == ControlType::kWatermark) {
@@ -165,15 +163,47 @@ SourceMerge::StepResult SourceMerge::ProduceOneMergedStep(Batch& out,
                             .checkpoint_offset = merged_offset_,
                         });
                     }
+                } else if (c.type == ControlType::kCheckpointBarrier) {
+                    // A per-source barrier arrived on channel i. Record it (do NOT
+                    // forward it — the merged stream carries ONE aligned barrier per
+                    // epoch) and try to close the open epoch. If this is an EARLY
+                    // arrival, IsChannelBlocked(i) is now true and channel i's
+                    // subsequent records stay buffered until every active channel
+                    // has delivered its barrier for this epoch.
+                    ++st.barriers_seen;
+                    MaybeCloseEpoch(out);
                 }
-                // Wrapped-source barriers are disabled (checkpoint_interval = 0),
-                // so kCheckpointBarrier is never produced here.
             }
         }, item);
 
         return StepResult::kProduced;
     }
     return StepResult::kExhausted;
+}
+
+void SourceMerge::MaybeCloseEpoch(Batch& out) {
+    const uint64_t next_epoch = epoch_closed_ + 1;
+    bool any_active = false;
+    for (const SourceState& st : states_) {
+        // Idle and exhausted channels are EXCLUDED from the alignment set — the
+        // same exclusion the watermark MIN applies. This is what guarantees a quiet
+        // (or ended) channel cannot hold up, and thus cannot deadlock, alignment.
+        if (st.exhausted || st.idle) continue;
+        any_active = true;
+        if (st.barriers_seen < next_epoch) return;  // this channel hasn't aligned yet
+    }
+    if (!any_active) return;  // no active channel to align (all idle/exhausted)
+
+    // Every active channel has delivered its barrier for `next_epoch`: emit ONE
+    // merged barrier stamped with the aligned cut's merged offset, then advance the
+    // closed-epoch counter — which unblocks every channel that was holding at this
+    // barrier (IsChannelBlocked becomes false for them).
+    epoch_closed_ = next_epoch;
+    out.items.emplace_back(ControlRecord{
+        .type = ControlType::kCheckpointBarrier,
+        .watermark = Timestamp::min(),
+        .checkpoint_offset = merged_offset_,
+    });
 }
 
 bool SourceMerge::AllExhausted() const {
