@@ -1,4 +1,5 @@
 #include "checkpoint/writer.h"
+#include <cinttypes>
 #include "checkpoint/crc32c.h"
 
 #include <algorithm>
@@ -71,7 +72,7 @@ void AppendSLE64(std::vector<uint8_t>& buf, int64_t v) {
 
 std::string CheckpointFilename(uint64_t offset) {
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "checkpoint-%020lu.ckpt", offset);
+    std::snprintf(buf, sizeof(buf), "checkpoint-%020" PRIu64 ".ckpt", offset);
     return buf;
 }
 

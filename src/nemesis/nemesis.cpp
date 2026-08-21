@@ -11,6 +11,7 @@
 #include "checkpoint/writer.h"
 #include "checkpoint/reader.h"
 
+#include <cinttypes>
 #include <algorithm>
 #include <csignal>
 #include <cstdio>
@@ -45,7 +46,7 @@ void RemoveDir(const std::string& path) {
 void CreateStaleTmpFile(const std::string& dir, uint64_t offset) {
     char filename[128];
     std::snprintf(filename, sizeof(filename),
-                  "%s/checkpoint-%020lu.ckpt.tmp", dir.c_str(), offset);
+                  "%s/checkpoint-%020" PRIu64 ".ckpt.tmp", dir.c_str(), offset);
     int fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         const char* garbage = "PARTIAL_CHECKPOINT_DATA";
@@ -230,8 +231,8 @@ NemesisResult RunNemesis(const NemesisConfig& config) {
             if (result.failure_detail.empty()) {
                 char buf[256];
                 std::snprintf(buf, sizeof(buf),
-                    "Value mismatch for key=%s window=[%ld,%ld): "
-                    "expected sum=%ld count=%lu, got sum=%ld count=%lu",
+                    "Value mismatch for key=%s window=[%" PRId64 ",%" PRId64 "): "
+                    "expected sum=%" PRId64 " count=%" PRIu64 ", got sum=%" PRId64 " count=%" PRIu64 "",
                     rk.key.c_str(), rk.window_start, rk.window_end,
                     val.sum, val.count, it->second.sum, it->second.count);
                 result.failure_detail = buf;
@@ -515,7 +516,7 @@ RealKillResult RunRealKillNemesis(const RealKillConfig& config) {
             if (result.failure_detail.empty()) {
                 char buf[256];
                 std::snprintf(buf, sizeof(buf),
-                    "Missing result: key=%s window=[%ld,%ld)",
+                    "Missing result: key=%s window=[%" PRId64 ",%" PRId64 ")",
                     r.key.c_str(), rk.window_start, rk.window_end);
                 result.failure_detail = buf;
             }
@@ -525,8 +526,8 @@ RealKillResult RunRealKillNemesis(const RealKillConfig& config) {
             if (result.failure_detail.empty()) {
                 char buf[256];
                 std::snprintf(buf, sizeof(buf),
-                    "Value mismatch key=%s window=[%ld,%ld): "
-                    "oracle sum=%ld count=%lu, got sum=%ld count=%lu",
+                    "Value mismatch key=%s window=[%" PRId64 ",%" PRId64 "): "
+                    "oracle sum=%" PRId64 " count=%" PRIu64 ", got sum=%" PRId64 " count=%" PRIu64 "",
                     r.key.c_str(), rk.window_start, rk.window_end,
                     r.result.value, r.result.count,
                     it->second.sum, it->second.count);
@@ -654,9 +655,25 @@ PartitionedRealKillResult RunPartitionedRealKillNemesis(
             }
             auto partial = HighestPartialCheckpoint(ckpt_root, n);
             if (complete && partial && *partial > *complete) {
-                ::kill(pid, SIGKILL);
-                killed = true;
-                break;
+                // Freeze the child before killing: on fast fsync (e.g. Apple
+                // silicon/APFS) the torn window between the (N-1)th and Nth
+                // partition rename is near-instantaneous, and the final rename
+                // can land between this detection and the SIGKILL, healing the
+                // torn state and wasting the attempt (observed: 3/10 capture
+                // failures at N=2 on an M-series Mac). SIGSTOP freezes the
+                // child; re-verify tornness while frozen (an already-in-flight
+                // rename may still complete), then SIGKILL -- which is
+                // delivered even to a stopped process -- so the persisted torn
+                // state cannot change. If the race was lost, resume and retry.
+                ::kill(pid, SIGSTOP);
+                auto c2 = HighestCompleteCheckpoint(ckpt_root, n);
+                auto p2 = HighestPartialCheckpoint(ckpt_root, n);
+                if (c2 && p2 && *p2 > *c2) {
+                    ::kill(pid, SIGKILL);
+                    killed = true;
+                    break;
+                }
+                ::kill(pid, SIGCONT);
             }
         }
 
@@ -718,14 +735,14 @@ PartitionedRealKillResult RunPartitionedRealKillNemesis(
     if (result.restored_offset != captured_complete) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "restore used offset %lu, expected complete offset %lu (torn=%lu)",
+            "restore used offset %" PRIu64 ", expected complete offset %" PRIu64 " (torn=%" PRIu64 ")",
             result.restored_offset, captured_complete, captured_torn);
         result.failure_detail = buf;
     }
     if (result.restored_offset >= captured_torn) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "restore offset %lu did not fall back below torn offset %lu",
+            "restore offset %" PRIu64 " did not fall back below torn offset %" PRIu64 "",
             result.restored_offset, captured_torn);
         if (result.failure_detail.empty()) result.failure_detail = buf;
     }
@@ -782,7 +799,7 @@ PartitionedRealKillResult RunPartitionedRealKillNemesis(
             if (result.failure_detail.empty()) {
                 char buf[256];
                 std::snprintf(buf, sizeof(buf),
-                    "Missing result: key=%s window=[%ld,%ld)",
+                    "Missing result: key=%s window=[%" PRId64 ",%" PRId64 ")",
                     r.key.c_str(), rk.window_start, rk.window_end);
                 result.failure_detail = buf;
             }
@@ -792,8 +809,8 @@ PartitionedRealKillResult RunPartitionedRealKillNemesis(
             if (result.failure_detail.empty()) {
                 char buf[256];
                 std::snprintf(buf, sizeof(buf),
-                    "Value mismatch key=%s window=[%ld,%ld): "
-                    "oracle sum=%ld count=%lu, got sum=%ld count=%lu",
+                    "Value mismatch key=%s window=[%" PRId64 ",%" PRId64 "): "
+                    "oracle sum=%" PRId64 " count=%" PRIu64 ", got sum=%" PRId64 " count=%" PRIu64 "",
                     r.key.c_str(), rk.window_start, rk.window_end,
                     r.result.value, r.result.count,
                     it->second.sum, it->second.count);

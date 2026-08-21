@@ -175,7 +175,7 @@ static void BenchmarkScalingCurve() {
     constexpr int kReps = 7;
     std::cout << "=== Partitioned Scaling Curve ===\n";
     std::cout << "  Workload: 1M records, 1000 keys, tumbling 1s, MemorySink, no checkpointing\n";
-    std::cout << "  Hardware: 4-vCPU shared Intel Xeon 6975P-C. "
+    std::cout << "  Hardware: this machine (README reference numbers: 4-vCPU shared Xeon 6975P-C). "
               << kReps << " reps; median (min-max) M rec/s\n";
     std::cout << "  (Router thread + N workers + merge: N=4 and N=8 oversubscribe 4 vCPUs.)\n\n";
 
@@ -205,7 +205,7 @@ static void BenchmarkCheckpointOverhead() {
     std::cout << "=== Partitioned Checkpoint Overhead (N=" << kN << ") ===\n";
     std::cout << "  Workload: 1M records, 1000 keys, tumbling 1s; checkpoint interval "
               << kCkptInterval << " records\n";
-    std::cout << "  Hardware: 4-vCPU shared Intel Xeon 6975P-C. "
+    std::cout << "  Hardware: this machine (README reference numbers: 4-vCPU shared Xeon 6975P-C). "
               << kReps << " reps; median (min-max) M rec/s\n\n";
 
     // OFF: reuse the no-checkpoint partitioned run at N.

@@ -116,6 +116,7 @@ The **1.68 ms snapshot load is the portable restore cost** — scan four partiti
 | Metric | Value | How measured |
 |--------|-------|--------------|
 | Pipeline throughput (default config) | ~8.5–9.0 M rec/s (quiet box) | 1M records, 100 keys, tumbling 1s, Release -O3 -march=native, interleaved A/B reps on 4-vCPU Xeon 6975P-C. An earlier published ~1.8 M rec/s figure was measured on the same box under contention and has been retracted as an engine number |
+| Partitioned scaling, second hardware (Apple M-series, 8 perf cores, macOS/libc++) | single 7.78 M rec/s; partitioned N=1 6.70, N=2 6.22, N=4 4.96, N=8 0.57 | Same `make bench` workload on real cores. Still regresses, but far milder until N=8 (10 threads): the queue hand-off costs ~14% here vs ~48% on the 4-vCPU box, the serial Router bounds N=2/4, and N=8 collapses from oversubscription. Confirms the diagnosis: the ceiling is the hand-off + Router, not the workers |
 | Pane-index scaling (isolation bench) | flat ~10 M rec/s at 20K live panes, all watermark rates | `stormglass_scanbench`: before the index, throughput swung 16× with watermark frequency and collapsed 11× as pane count grew; after, both sweeps are flat within ~1.1× |
 | Checkpoint pause | ~5.6 ms at 1000 panes (~10 ms at 10K) | Direct measurement in `make bench` (Checkpoint Pause section): 20 writes each of serialize + fsync + rename + dir-fsync. Dominated by fsync |
 
@@ -186,7 +187,7 @@ make bench                           # Release throughput: single-threaded + che
 - **At-least-once, not exactly-once** (idempotent sink upgrades to effectively-once; not built).
 - **Checkpoint pauses the operator** (upgrade path: clone-then-serialize-async).
 - **No persistent source integration** (future: Postgres CDC via logical decoding); the in-memory generator's `Seek` is O(offset).
-- **ThreadSanitizer is CI/Mac-only.** DevSpaces lacks libtsan (and libasan), so the sanitized/TSan build runs in CI and on macOS, not on the DevSpaces box these numbers were measured on.
+- **ThreadSanitizer is CI/Mac-only** (the DevSpaces build host lacks libtsan/libasan). Verified: TSan-instrumented run of all 15 partitioned/invariance/cross-N tests on Apple clang 21/arm64 — zero race reports.
 
 ## Tech stack
 
