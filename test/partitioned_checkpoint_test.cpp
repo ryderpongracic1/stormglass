@@ -286,4 +286,65 @@ TEST(PartitionedRealKillNemesis, TornGlobalCheckpointZeroMissing) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 4. Restore-timing hook (Phase 4 bench instrumentation). The additive
+//    restore_state_micros / restore_seek_micros Stats fields must be zero on a
+//    non-checkpointing run (the restore block is skipped entirely) and must be
+//    populated when a real restore occurs. Guards the semantics-neutral hook
+//    the partitioned bench reads.
+// ---------------------------------------------------------------------------
+TEST_F(PartitionedCheckpointTest, RestoreTimingZeroWithoutCheckpointing) {
+    auto gen = MakeGen(/*seed=*/5, /*num_records=*/8000, /*checkpoint_interval=*/0);
+    auto sink = std::make_unique<MemorySink>();
+    PartitionedPipelineConfig pc{};
+    pc.num_workers = 4;
+    // checkpoint_dir deliberately empty: no restore block runs.
+    PartitionedPipeline pipeline(
+        std::make_unique<DeterministicGenerator>(gen),
+        [] { return std::make_unique<TumblingAssigner>(Duration{1000}); },
+        std::move(sink), pc);
+    auto stats = pipeline.Run();
+    EXPECT_EQ(stats.records_replayed, 0u);
+    EXPECT_EQ(stats.restore_state_micros, 0u);
+    EXPECT_EQ(stats.restore_seek_micros, 0u);
+}
+
+TEST_F(PartitionedCheckpointTest, RestoreTimingPopulatedOnRealRestore) {
+    const uint32_t n = 4;
+    const uint64_t total = 20000;
+    const uint64_t interval = 1000;
+    auto gen = MakeGen(/*seed=*/9, total, interval);
+
+    // Populate a checkpoint set by stopping partway.
+    {
+        auto sink = std::make_unique<MemorySink>();
+        PartitionedPipelineConfig pc{};
+        pc.num_workers = n;
+        pc.checkpoint_dir = dir_;
+        PartitionedPipeline pipeline(
+            std::make_unique<StoppingSource>(
+                std::make_unique<DeterministicGenerator>(gen), 12000u),
+            [] { return std::make_unique<TumblingAssigner>(Duration{1000}); },
+            std::move(sink), pc);
+        pipeline.Run();
+    }
+
+    // Fresh pipeline restores; both the state load and the O(offset) Seek run.
+    auto sink = std::make_unique<MemorySink>();
+    PartitionedPipelineConfig pc{};
+    pc.num_workers = n;
+    pc.checkpoint_dir = dir_;
+    PartitionedPipeline pipeline(
+        std::make_unique<DeterministicGenerator>(gen),
+        [] { return std::make_unique<TumblingAssigner>(Duration{1000}); },
+        std::move(sink), pc);
+    auto stats = pipeline.Run();
+
+    ASSERT_GT(stats.records_replayed, 0u) << "restore did not occur";
+    // The generator's Seek replays thousands of records, so it is reliably
+    // nonzero at microsecond resolution — the hook is wired to the restore path.
+    EXPECT_GT(stats.restore_seek_micros, 0u)
+        << "restore_seek_micros should reflect the O(offset) Seek replay";
+}
+
 }  // namespace

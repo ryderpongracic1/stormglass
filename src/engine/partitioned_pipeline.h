@@ -83,6 +83,18 @@ public:
         // Checkpoint quantities (0 when checkpoint_dir is empty).
         uint64_t checkpoints_written = 0;  // summed across workers (per-partition files)
         uint64_t records_replayed = 0;     // offset of the complete checkpoint restored from
+        // Restore-cost breakdown (additive bench hook; semantics-neutral). Both
+        // measure the RESTORE step only — before the worker drain begins — and
+        // are 0 when checkpoint_dir is empty or no complete checkpoint exists.
+        //   * restore_state_micros: coordinator scan (HighestCompleteCheckpoint)
+        //     + per-partition LoadOffset + KeyedProcessor::Restore. This is the
+        //     "load the snapshot" cost — the number a replayable-log deployment
+        //     would pay.
+        //   * restore_seek_micros: source_->Seek(offset). For the in-memory
+        //     DeterministicGenerator this is an O(offset) replay (a documented
+        //     toy-source limitation); a real log source seeks in ~O(1).
+        uint64_t restore_state_micros = 0;
+        uint64_t restore_seek_micros = 0;
     };
 
     Stats Run();

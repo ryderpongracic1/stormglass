@@ -8,6 +8,7 @@
 #include "sink/memory_sink.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -94,6 +95,7 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
     // remaining records to the same workers.
     Stats stats{};
     if (checkpointing) {
+        const auto scan_t0 = std::chrono::steady_clock::now();
         if (auto complete = HighestCompleteCheckpoint(config_.checkpoint_dir, n)) {
             for (uint32_t i = 0; i < n; ++i) {
                 CheckpointReader reader(workers[i]->ckpt_dir);
@@ -101,8 +103,16 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
                     workers[i]->processor->Restore(*data);
                 }
             }
+            const auto seek_t0 = std::chrono::steady_clock::now();
             source_->Seek(*complete);
+            const auto seek_t1 = std::chrono::steady_clock::now();
             stats.records_replayed = *complete;
+            stats.restore_state_micros = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    seek_t0 - scan_t0).count());
+            stats.restore_seek_micros = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    seek_t1 - seek_t0).count());
         }
     }
 
