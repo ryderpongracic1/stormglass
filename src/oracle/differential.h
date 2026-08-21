@@ -48,6 +48,19 @@ struct DifferentialConfig {
     // Read ONLY by RunMultiSourceDifferential; the single-source harnesses ignore
     // it, so they stay byte-for-byte unchanged.
     uint32_t sources = 1;
+
+    // Multi-source idleness (v3 Phase 2). idle_timeout == 0 (default) DISABLES
+    // idleness: no source is excluded and the harness reproduces the Phase-1
+    // min-combine trajectory bit-for-bit. When > 0 (and >= 2 sources), the
+    // SLOWEST source (index sources-1, which pins the MIN) is given a single idle
+    // span: it goes quiet for idle_span_length turns starting at data-record
+    // idle_span_start, is excluded after idle_timeout empty pulls (so the merged
+    // watermark advances via the faster sources), then resumes with
+    // below-watermark records that the existing lateness policy classifies.
+    // Read ONLY by RunMultiSourceDifferential's MakeMergeConfig.
+    uint32_t idle_timeout = 0;
+    uint64_t idle_span_start = 0;    // slow source's data-record index where the gap begins
+    uint64_t idle_span_length = 0;   // gap length in idle ticks (0 = no gap)
 };
 
 struct DifferentialResult {

@@ -435,10 +435,20 @@ SourceMergeConfig MakeMergeConfig(const DifferentialConfig& config,
     SourceMergeConfig mc;
     mc.checkpoint_interval = 0;   // differential does not checkpoint
     mc.merged_batch_size = 1024;
+    mc.idle_timeout = config.idle_timeout;   // 0 = idleness disabled (Phase-1)
     for (uint32_t i = 0; i < k; ++i) {
         GeneratorConfig g = MakeGenConfig(config, seed + static_cast<uint64_t>(i) * 7919u);
         g.event_time_step = static_cast<int64_t>(k - i);  // source 0 fastest
         mc.sources.push_back(g);
+    }
+    // v3 Phase 2: give the SLOWEST source (index k-1, which pins the MIN) a single
+    // idle span so it is excluded after idle_timeout empty pulls and the merged
+    // watermark advances via the faster sources; on resume its below-watermark
+    // records are late. Only meaningful with >= 2 sources (a lone source has no
+    // faster peer to advance the watermark while it is excluded).
+    if (config.idle_timeout > 0 && config.idle_span_length > 0 && k >= 2) {
+        mc.sources.back().idle_spans.push_back(
+            IdleSpan{config.idle_span_start, config.idle_span_length});
     }
     return mc;
 }

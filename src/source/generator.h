@@ -4,8 +4,26 @@
 
 #include <cstdint>
 #include <random>
+#include <vector>
 
 namespace stormglass {
+
+/// A deterministic idle span, expressed in the SOURCE's OWN data-record index
+/// (NOT wall-clock — see SourceMergeConfig::idle_timeout). It means: once this
+/// source has produced exactly `start_offset` data records, it goes quiet for
+/// `length` consecutive round-robin turns before producing its next data record.
+/// The delayed record keeps its ORIGINAL event-time, so when it finally appears
+/// the merged watermark may already have advanced past it (making it late).
+///
+/// This is consumed ONLY by SourceMerge (which pauses the wrapped generator for
+/// the span, freezing its watermark). The standalone DeterministicGenerator
+/// IGNORES it, so a bare generator is byte-for-byte unchanged. Spans must be
+/// sorted by start_offset and non-overlapping. Default (empty) == no gaps ==
+/// Phase-1 behavior.
+struct IdleSpan {
+    uint64_t start_offset = 0;  // this source's data-record index where the gap begins
+    uint64_t length = 0;        // consecutive empty pulls (idle ticks) before resuming
+};
 
 /// Controls how the generator distributes event-time disorder.
 ///   kBounded     — jitter is uniform in [-max_disorder, 0]. Combined with the
@@ -44,6 +62,12 @@ struct GeneratorConfig {
     DisorderMode disorder_mode = DisorderMode::kBounded;
     double late_fraction = 0.0;   // P(record is a heavy-tail late record), [0, 1]
     Duration late_tail{0};        // max extra lateness beyond max_disorder
+
+    // Idle spans (v3 Phase 2). Consumed ONLY by SourceMerge to MODEL a source
+    // going quiet; the standalone DeterministicGenerator IGNORES this field, so
+    // a bare generator remains byte-for-byte unchanged. Empty (default) == no
+    // gaps == Phase-1 behavior. See IdleSpan.
+    std::vector<IdleSpan> idle_spans;
 };
 
 class DeterministicGenerator : public Source {
