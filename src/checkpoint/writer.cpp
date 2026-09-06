@@ -16,7 +16,7 @@ namespace stormglass {
 namespace {
 
 constexpr uint32_t kMagic = 0x4B434753;  // "SGCK" little-endian
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 
 // Header layout (32 bytes):
 //   magic:        4 bytes
@@ -44,8 +44,8 @@ bool WriteAll(int fd, const void* data, size_t len) {
     size_t written = 0;
     while (written < len) {
         auto n = ::write(fd, ptr + written, len - written);
-        if (n < 0) {
-            if (errno == EINTR) continue;
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
             return false;
         }
         written += static_cast<size_t>(n);
@@ -82,8 +82,8 @@ std::string TmpFilename(uint64_t offset) {
 
 } // namespace
 
-CheckpointWriter::CheckpointWriter(const std::string& checkpoint_dir)
-    : dir_(checkpoint_dir) {}
+CheckpointWriter::CheckpointWriter(const std::string& checkpoint_dir, bool retain_all)
+    : dir_(checkpoint_dir), retain_all_(retain_all) {}
 
 bool CheckpointWriter::WriteCheckpoint(uint64_t offset, Timestamp watermark,
                                         const KeyedWindowState& state) {
@@ -119,7 +119,15 @@ bool CheckpointWriter::WriteCheckpoint(uint64_t offset, Timestamp watermark,
         AppendSLE64(payload, w.end.time_since_epoch().count());
     }
 
-    // Compute CRC over header + body + fired windows
+    // Pending updates must survive a barrier between late input and re-fire.
+    const auto pending = state.RefiredWindows();
+    AppendLE64(payload, pending.size());
+    for (const auto& w : pending) {
+        AppendSLE64(payload, w.start.time_since_epoch().count());
+        AppendSLE64(payload, w.end.time_since_epoch().count());
+    }
+
+    // Compute CRC over all persisted state
     uint32_t crc = Crc32c(payload.data(), payload.size());
 
     // Trailer
@@ -154,12 +162,12 @@ bool CheckpointWriter::WriteCheckpoint(uint64_t offset, Timestamp watermark,
 
     // fsync the directory to persist the rename
     int dir_fd = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
-    if (dir_fd >= 0) {
-        ::fsync(dir_fd);
-        ::close(dir_fd);
-    }
+    if (dir_fd < 0) return false;
+    const int sync_result = ::fsync(dir_fd);
+    ::close(dir_fd);
+    if (sync_result != 0) return false;
 
-    CleanOldCheckpoints(offset);
+    if (!retain_all_) CleanOldCheckpoints(offset);
     return true;
 }
 

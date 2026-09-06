@@ -2,11 +2,17 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <stdexcept>
 
 namespace stormglass {
 
 DeterministicGenerator::DeterministicGenerator(GeneratorConfig config)
-    : config_(config), rng_(config.seed) {}
+    : config_(config), rng_(config.seed) {
+    if (!config.num_keys || !config.batch_size || !config.watermark_interval ||
+        config.max_disorder.count() < 0 || config.event_time_step < 0 ||
+        !(config.late_fraction >= 0 && config.late_fraction <= 1))
+        throw std::invalid_argument("invalid generator configuration");
+}
 
 Record DeterministicGenerator::GenerateRecord() {
     // Key: round-robin over num_keys, zero-padded 4 digits

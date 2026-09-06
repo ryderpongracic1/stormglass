@@ -25,3 +25,16 @@ jobs:
         run: ./build-release/app/stormglass_oracle --seeds 10 --records 10000
       - name: Nemesis (5 runs)
         run: ./build-release/app/stormglass_nemesis --seeds 5 --verbose
+  thread-sanitizer:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (TSan)
+        run: cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DSTORMGLASS_TSAN=ON
+      - name: Build
+        run: cmake --build build-tsan --parallel 4
+      - name: Test
+        run: ctest --test-dir build-tsan --output-on-failure --timeout 120

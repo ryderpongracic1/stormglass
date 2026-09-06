@@ -21,6 +21,7 @@ struct CheckpointData {
         uint64_t count;
     };
     std::vector<PaneEntry> panes;
+    std::vector<Window> refired_windows;  // v3: pending late updates
     std::vector<Window> fired_windows;  // v2+: persisted fired-window set
 };
 

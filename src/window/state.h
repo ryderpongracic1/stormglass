@@ -4,6 +4,8 @@
 #include "sink/sink.h"
 
 #include <map>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,7 +30,14 @@ struct KeyWindowHash {
 struct Pane {
     int64_t sum = 0;
     uint64_t count = 0;
-    void Add(int64_t v) { sum += v; ++count; }
+    void Add(int64_t v) {
+        if ((v > 0 && sum > std::numeric_limits<int64_t>::max() - v) ||
+            (v < 0 && sum < std::numeric_limits<int64_t>::min() - v) ||
+            count == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("pane aggregate overflow");
+        sum += v;
+        ++count;
+    }
 };
 
 // Orders windows by end (then start) so that "all windows expired by watermark"
@@ -103,6 +112,10 @@ public:
         for (const auto& w : windows) {
             fired_windows_.insert(w);
         }
+    }
+
+    void RestoreRefiredWindows(const std::vector<Window>& windows) {
+        refired_windows_.insert(windows.begin(), windows.end());
     }
 
 private:

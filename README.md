@@ -1,5 +1,13 @@
 # stormglass
 
+> **2026-09-06 hardening audit:** current local Release validation passes
+> 153 tests; arm64 ASan/UBSan and TSan cover all 153 distinct tests. Historical benchmark and
+> sanitizer numbers below describe earlier revisions and are not current results.
+> Checkpoint format v3 now preserves pending late-window re-fires. Partitioned
+> checkpoints retain history to preserve a common recovery cut; coordinated
+> retention remains future work. Sources and sinks must satisfy the recovery
+> contract described under limitations; checkpointing alone does not guarantee output delivery.
+
 Event-time stream processing engine with verified windowed aggregation semantics.
 
 Single-process, keyed-parallel event-time stream processor with **multi-source fan-in**. Tumbling and sliding windows, bounded out-of-orderness watermarks, at-least-once delivery via atomic checkpoint/restore. Work is partitioned across N shared-nothing workers by key, and **K independent sources are merged upstream by a `SourceMerge`** that min-combines their watermarks, detects idle sources deterministically, and aligns their checkpoint barriers K-way (Chandy-Lamport). The headline correctness property is that **an unmodified differential oracle, fed the same deterministic interleaved multi-source input, computes exactly the drop/fire decisions the engine makes** — and crash recovery holds at-least-once through SIGKILLs landed *mid-barrier-alignment*.
@@ -212,6 +220,10 @@ Absolute drop/late counts are **libstdc++ (GCC) numbers**. `std::uniform_int_dis
 
 ## Reproduce
 
+For host-recording guidance, repeatable macOS runs, and the constraints for a
+defensible Apache Flink comparison, see
+[`docs/BENCHMARKING_MACOS.md`](docs/BENCHMARKING_MACOS.md).
+
 ```bash
 make build && make test              # 143 tests, Debug (+ASan/UBSan where the runtime is available)
 make bench                           # Release: single-threaded + checkpoint pause + partitioned
@@ -254,11 +266,11 @@ Remaining boundaries:
 
 - **Sources are still deterministic in-memory generators.** No Kafka / CDC / socket integration; the merge and its alignment are exercised in their deterministic, replayable form (which is what makes the oracle proof possible), not against a live broker. Integrating a real replayable-log source is the next arc.
 - **Single process; alignment adds no concurrency.** `SourceMerge` is one Source pulled by one thread — the K-way Chandy-Lamport alignment is sequential bookkeeping over in-memory buffers, not K concurrent input threads with marker buffering. Genuine cross-machine distribution (sources and workers on separate hosts, network markers, distributed coordinator) is out of scope.
-- **At-least-once, not exactly-once** (idempotent sink upgrades to effectively-once; not built).
-- **Multicore throughput speedup is unproven post-batching.** The pre-batching scaling curve regressed at N≥4 on a 4-vCPU box, but that was **largely per-record hand-off granularity** (one mutex + `notify_one` per record), not the workload: v3.1 batches the Router hand-off and cut that overhead 44–56% on a 1-vCPU box. Overhead reduction is not parallel speedup, though — a multicore re-measurement (4-vCPU / Apple M-series) is **pending**, so partitioning's throughput benefit on compute-light workloads is currently **TBD**. It buys parallelism-invisible semantics and multi-source readiness regardless of that outcome.
-- **Multi-restart checkpoint healing requires a stable checkpoint interval and source config.** Barriers land at deterministic offsets (`N · Σ I_i`), so on restart the replay re-writes the missing partition files and **heals** a torn offset *before* reaching the next barrier — torn offsets therefore cannot *stack* under steady configuration, and last-2 per-partition retention is sufficient for that case. Stacking becomes reachable only if the **checkpoint interval or source configuration changes across restarts**, which moves the barrier offsets and defeats the deterministic re-write. That configuration stability across restarts — not retention depth — is the real invariant for multi-restart recovery.
+- **Delivery:** the crash harness preserves output in separate pre/post files and verifies their union. Replay duplicates are permitted. Default MemorySink output is volatile, and DurableFileSink truncates on construction; use distinct run files and retain previous output. No input event-ID deduplication, transactional sink, or end-to-end exactly-once guarantee is implemented.
+- **Performance is workload- and host-specific.** New arm64 Release measurements: 9.69M rec/s median at N=2 (7 reps, 1M records, 1000 keys), versus 5.85M single-threaded on the same workload; 9.44–9.55M rec/s in the 20K-pane isolation benchmark. Historical 44–56% overhead reduction has not been independently reproduced by this audit.
+- **Partition retention and configuration:** partition workers retain all checkpoints so a fast worker cannot prune the last common cut. Disk use and recovery scanning grow with history; coordinated pruning remains future work. Keep worker count, window configuration, lateness, source ordering, seed, and barrier cadence stable across restarts. No configuration fingerprint or rescaling protocol is implemented.
 - **Checkpoint pauses the operator** (upgrade path: clone-then-serialize-async).
-- **Concurrency is race-checked on two platforms × two architectures — zero reports.** ThreadSanitizer, which previously ran only on Mac, is now verified on Linux/x86-64 as well (libtsan installed, the full 143-test suite, zero races) *and* on Apple clang/arm64 (the 42-test threaded subset — all partitioned/invariance/cross-N suites plus the v3 SourceMerge, idle, alignment, and mid-alignment-nemesis suites, including multi-source streams driven through the threaded `PartitionedPipeline` — zero races). This is no longer a coverage gap.
+- **Sanitizer evidence:** the local arm64 run passed the full 151-test suite, then all 10 hardening tests after two new format tests were added, covering 153 distinct tests with each sanitizer build. Separate ASan/UBSan and TSan builds are supported; CI includes Linux and macOS TSan jobs. An unexecuted CI job is not a clean sanitizer result.
 
 ## Tech stack
 

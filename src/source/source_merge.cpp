@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <utility>
+#include <stdexcept>
 #include <variant>
 
 namespace stormglass {
@@ -9,6 +10,7 @@ namespace stormglass {
 SourceMerge::SourceMerge(SourceMergeConfig config)
     : config_(std::move(config)),
       combiner_(std::max<std::size_t>(1, config_.sources.size())) {
+    if (config_.merged_batch_size == 0) throw std::invalid_argument("merged batch size must be positive");
     ResetState();
 }
 
@@ -118,8 +120,15 @@ SourceMerge::StepResult SourceMerge::ProduceOneMergedStep(Batch& out,
             // This source just exhausted. Remove it from the alignment set: the
             // remaining active channels may now be able to close the open epoch
             // (a dead channel can never deliver another barrier).
+            if (auto merged = combiner_.MarkIdle(i)) {
+                out.items.emplace_back(ControlRecord{
+                    .type = ControlType::kWatermark,
+                    .watermark = *merged,
+                    .checkpoint_offset = merged_offset_,
+                });
+            }
             MaybeCloseEpoch(out);
-            continue;  // try the next source
+            return StepResult::kProduced;  // retry: closing the epoch may unblock an earlier channel
         }
         // Advance the round-robin cursor PAST the source we pulled from, so the
         // interleaving is a strict, reproducible rotation over live sources.

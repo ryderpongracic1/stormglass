@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
+#include <stdexcept>
 #include <optional>
 #include <queue>
 #include <utility>
@@ -26,7 +27,9 @@ namespace stormglass {
 template <typename T>
 class BoundedQueue {
 public:
-    explicit BoundedQueue(std::size_t capacity) : capacity_(capacity) {}
+    explicit BoundedQueue(std::size_t capacity) : capacity_(capacity) {
+        if (capacity == 0) throw std::invalid_argument("queue capacity must be positive");
+    }
 
     // Blocks while the queue is full. Returns false if the queue was closed.
     bool Push(T value) {

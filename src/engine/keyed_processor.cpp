@@ -3,6 +3,7 @@
 #include "checkpoint/writer.h"
 
 #include <utility>
+#include <stdexcept>
 
 namespace stormglass {
 
@@ -15,6 +16,7 @@ KeyedProcessor::KeyedProcessor(std::unique_ptr<WindowAssigner> assigner,
       allowed_lateness_(allowed_lateness),
       use_lateness_(allowed_lateness.count() > 0),
       checkpoint_dir_(std::move(checkpoint_dir)) {
+    if (allowed_lateness_.count() < 0) throw std::invalid_argument("lateness must be nonnegative");
     if (use_lateness_) {
         state_.SetAllowedLateness(allowed_lateness_);
     }
@@ -90,9 +92,14 @@ void KeyedProcessor::ProcessControl(const ControlRecord& c) {
         // distributed_checkpoint.h) treats the N files for O as one global
         // checkpoint, complete only when all N exist.
         if (!checkpoint_dir_.empty()) {
-            CheckpointWriter writer(checkpoint_dir_);
+            sink_.Flush();
+            // Independent pruning can delete the last common recovery cut.
+            // Retain partition history until coordinated retention is available.
+            CheckpointWriter writer(checkpoint_dir_, true);
             if (writer.WriteCheckpoint(c.checkpoint_offset, watermark_.Current(), state_)) {
                 stats_.checkpoints_written++;
+            } else {
+                throw std::runtime_error("partition checkpoint write failed");
             }
         }
     }
@@ -138,6 +145,7 @@ void KeyedProcessor::Restore(const CheckpointData& data) {
     if (!data.fired_windows.empty()) {
         state_.RestoreFiredWindows(data.fired_windows);
     }
+    state_.RestoreRefiredWindows(data.refired_windows);
     watermark_.Advance(data.watermark);
 }
 

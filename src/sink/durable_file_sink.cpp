@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <system_error>
 
 namespace stormglass {
 
@@ -15,8 +16,8 @@ bool WriteAll(int fd, const void* data, size_t len) {
     size_t written = 0;
     while (written < len) {
         auto n = ::write(fd, ptr + written, len - written);
-        if (n < 0) {
-            if (errno == EINTR) continue;
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
             return false;
         }
         written += static_cast<size_t>(n);
@@ -49,6 +50,7 @@ uint64_t ReadLE64(const uint8_t* p) {
 
 DurableFileSink::DurableFileSink(const std::string& path) {
     fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_ < 0) throw std::system_error(errno, std::generic_category(), "open sink");
 }
 
 DurableFileSink::~DurableFileSink() {
@@ -70,13 +72,14 @@ void DurableFileSink::Emit(const WindowResult& result) {
     // A single write() places the bytes in the kernel page cache, which already
     // survives a process SIGKILL; fsync additionally hardens against machine
     // crash so the durability guarantee holds under either failure model.
-    if (WriteAll(fd_, buf.data(), buf.size())) {
-        ::fsync(fd_);
-    }
+    if (!WriteAll(fd_, buf.data(), buf.size()))
+        throw std::system_error(errno, std::generic_category(), "write sink");
+    Flush();
 }
 
 void DurableFileSink::Flush() {
-    if (fd_ >= 0) ::fsync(fd_);
+    if (fd_ >= 0 && ::fsync(fd_) != 0)
+        throw std::system_error(errno, std::generic_category(), "fsync sink");
 }
 
 std::vector<WindowResult> DurableFileSink::ReadAll(const std::string& path) {

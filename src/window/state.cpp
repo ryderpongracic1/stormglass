@@ -1,8 +1,10 @@
 #include "window/state.h"
+#include <stdexcept>
 
 namespace stormglass {
 
 void KeyedWindowState::SetAllowedLateness(Duration lateness) {
+    if (lateness.count() < 0) throw std::invalid_argument("lateness must be nonnegative");
     allowed_lateness_ = lateness;
 }
 
@@ -13,7 +15,8 @@ void KeyedWindowState::Add(const std::string& key, const Window& window, int64_t
 bool KeyedWindowState::AddWithLateness(const std::string& key, const Window& window,
                                         int64_t value, Timestamp current_watermark) {
     // If watermark has passed the absolute deadline, always drop
-    auto deadline = window.end + allowed_lateness_;
+    auto deadline = window.end > Timestamp::max() - allowed_lateness_
+        ? Timestamp::max() : window.end + allowed_lateness_;
     if (current_watermark >= deadline) {
         return false;
     }
@@ -72,7 +75,8 @@ std::vector<WindowResult> KeyedWindowState::FireWindow(const Window& window) {
 std::vector<Window> KeyedWindowState::GarbageCollectableWindows(Timestamp watermark) const {
     std::vector<Window> gc;
     for (const auto& w : fired_windows_) {
-        auto deadline = w.end + allowed_lateness_;
+        auto deadline = w.end > Timestamp::max() - allowed_lateness_
+            ? Timestamp::max() : w.end + allowed_lateness_;
         if (watermark >= deadline) {
             gc.push_back(w);
         }

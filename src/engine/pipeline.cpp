@@ -1,6 +1,7 @@
 #include "engine/pipeline.h"
 
 #include <variant>
+#include <stdexcept>
 
 namespace stormglass {
 
@@ -16,6 +17,7 @@ Pipeline::Pipeline(std::unique_ptr<Source> source,
       assigner_(std::move(assigner)),
       sink_(std::move(sink)),
       config_(config) {
+    if (config_.allowed_lateness.count() < 0) throw std::invalid_argument("lateness must be nonnegative");
     if (config_.allowed_lateness.count() > 0) {
         state_.SetAllowedLateness(config_.allowed_lateness);
     }
@@ -41,6 +43,7 @@ void Pipeline::TryRestore() {
     }
 
     // Restore watermark
+    state_.RestoreRefiredWindows(data->refired_windows);
     watermark_.Advance(data->watermark);
 
     // Seek source past the checkpointed offset
@@ -49,9 +52,12 @@ void Pipeline::TryRestore() {
 }
 
 void Pipeline::WriteCheckpoint(uint64_t offset, Stats& stats) {
+    sink_->Flush();
     CheckpointWriter writer(config_.checkpoint_dir);
     if (writer.WriteCheckpoint(offset, watermark_.Current(), state_)) {
         stats.checkpoints_written++;
+    } else {
+        throw std::runtime_error("checkpoint write failed");
     }
 }
 

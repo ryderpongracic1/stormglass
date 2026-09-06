@@ -4,6 +4,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(STORMGLASS_SANITIZERS "Enable ASan + UBSan" OFF)
+option(STORMGLASS_TSAN "Enable ThreadSanitizer" OFF)
+if(STORMGLASS_TSAN AND STORMGLASS_SANITIZERS)
+    message(FATAL_ERROR "Use separate builds for TSan and ASan/UBSan")
+endif()
+if(STORMGLASS_TSAN)
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=thread)
+endif()
 option(STORMGLASS_BENCH "Build benchmarks" OFF)
 if(STORMGLASS_SANITIZERS)
     # Verify the sanitizer runtime actually works on this system before
@@ -23,10 +31,9 @@ if(STORMGLASS_SANITIZERS)
         add_link_options(-fsanitize=address,undefined)
         message(STATUS "stormglass: ASan + UBSan enabled")
     else()
-        message(WARNING
+        message(FATAL_ERROR
             "stormglass: STORMGLASS_SANITIZERS=ON but the sanitizer runtime "
-            "does not work on this system (libasan missing?). Building "
-            "WITHOUT sanitizers. CI still runs the sanitized build.")
+            "does not work on this system; refusing an unsanitized validation build.")
     endif()
 endif()
 include(cmake/FetchGoogleTest.cmake)

@@ -10,7 +10,7 @@ namespace stormglass {
 
 class CheckpointWriter {
 public:
-    explicit CheckpointWriter(const std::string& checkpoint_dir);
+    explicit CheckpointWriter(const std::string& checkpoint_dir, bool retain_all = false);
 
     // Write a checkpoint atomically: write to .tmp, fsync, rename to final name.
     // Returns true on success.
@@ -19,6 +19,7 @@ public:
 
 private:
     std::string dir_;
+    bool retain_all_;
 
     // Retain last 2 checkpoints, delete older ones.
     void CleanOldCheckpoints(uint64_t current_offset);

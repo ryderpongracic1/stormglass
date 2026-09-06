@@ -13,7 +13,7 @@ namespace stormglass {
 namespace {
 
 constexpr uint32_t kMagic = 0x4B434753;  // "SGCK" little-endian
-constexpr uint32_t kMaxVersion = 2;
+constexpr uint32_t kMaxVersion = 3;
 constexpr size_t kHeaderSize = 32;
 constexpr size_t kTrailerSize = 12;
 
@@ -179,6 +179,7 @@ std::optional<CheckpointData> CheckpointReader::TryLoad(const std::string& path)
     CheckpointData result;
     result.offset = offset;
     result.watermark = Timestamp{Duration{watermark_ms}};
+    if (num_entries > (body_end - kHeaderSize) / 36) return std::nullopt;
     result.panes.reserve(num_entries);
 
     size_t pos = kHeaderSize;
@@ -209,6 +210,7 @@ std::optional<CheckpointData> CheckpointReader::TryLoad(const std::string& path)
         if (pos + 8 > body_end) return std::nullopt;
         uint64_t num_fired = ReadLE64(data.data() + pos);
         pos += 8;
+        if (num_fired > (body_end - pos) / 16) return std::nullopt;
         result.fired_windows.reserve(num_fired);
         for (uint64_t i = 0; i < num_fired; ++i) {
             if (pos + 16 > body_end) return std::nullopt;
@@ -216,6 +218,22 @@ std::optional<CheckpointData> CheckpointReader::TryLoad(const std::string& path)
             int64_t end = ReadSLE64(data.data() + pos); pos += 8;
             result.fired_windows.push_back(Window{
                 Timestamp{Duration{start}}, Timestamp{Duration{end}}});
+        }
+    }
+
+    if (version >= 3) {
+        if (body_end - pos < 8) return std::nullopt;
+        const auto count = ReadLE64(data.data() + pos);
+        pos += 8;
+        if (count > (body_end - pos) / 16) return std::nullopt;
+        result.refired_windows.reserve(count);
+        for (uint64_t i = 0; i < count; ++i) {
+            const auto start = ReadSLE64(data.data() + pos); pos += 8;
+            const auto end = ReadSLE64(data.data() + pos); pos += 8;
+            Window w{Timestamp{Duration{start}}, Timestamp{Duration{end}}};
+            if (std::find(result.fired_windows.begin(), result.fired_windows.end(), w)
+                == result.fired_windows.end()) return std::nullopt;
+            result.refired_windows.push_back(w);
         }
     }
 

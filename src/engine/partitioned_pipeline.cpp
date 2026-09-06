@@ -8,7 +8,10 @@
 #include "sink/memory_sink.h"
 
 #include <algorithm>
-#include <cassert>
+#include <atomic>
+#include <exception>
+#include <mutex>
+#include <stdexcept>
 #include <chrono>
 #include <filesystem>
 #include <string>
@@ -110,6 +113,8 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
                 CheckpointReader reader(workers[i]->ckpt_dir);
                 if (auto data = reader.LoadOffset(*complete)) {
                     workers[i]->processor->Restore(*data);
+                } else {
+                    throw std::runtime_error("complete checkpoint disappeared during restore");
                 }
             }
             const auto seek_t0 = std::chrono::steady_clock::now();
@@ -125,12 +130,35 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
         }
     }
 
+    std::atomic<bool> cancelled{false};
+    std::mutex error_mutex;
+    std::exception_ptr error;
+    auto fail = [&] {
+        {
+            std::lock_guard lock(error_mutex);
+            if (!error) error = std::current_exception();
+        }
+        cancelled.store(true);
+        for (auto& w : workers) w->queue.Close();
+    };
+    // Joining is also required when creating a thread itself fails.
+    struct JoinWorkers {
+        std::vector<std::unique_ptr<Worker>>& workers;
+        std::atomic<bool>& cancelled;
+        ~JoinWorkers() {
+            cancelled.store(true);
+            for (auto& w : workers) w->queue.Close();
+            for (auto& w : workers) if (w->thread.joinable()) w->thread.join();
+        }
+    } join_workers{workers, cancelled};
+
     // --- Worker loop: drain queue until EndOfStream, then final-flush ---
     for (uint32_t i = 0; i < n; ++i) {
         Worker* w = workers[i].get();
-        w->thread = std::thread([w] {
+        w->thread = std::thread([&, w] {
+          try {
             bool done = false;
-            while (!done) {
+            while (!done && !cancelled.load()) {
                 auto batch = w->queue.Pop();
                 if (!batch.has_value()) break;  // queue closed and drained
                 // Process messages in the EXACT order the Router appended them
@@ -151,7 +179,8 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
                     if (stop) { done = true; break; }
                 }
             }
-            w->processor->FinalFlush();
+            if (!cancelled.load()) w->processor->FinalFlush();
+          } catch (...) { fail(); }
         });
     }
 
@@ -159,10 +188,12 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
     // Runs on its own thread to match the Source -> Router -> Workers topology;
     // the calling thread becomes the Merge stage after join.
     std::thread router([&] {
-        // One pending vector per worker, reused across source batches to avoid
-        // per-batch reallocation; cleared at the start of each source batch.
+      try {
+        // One pending vector per worker; ownership transfers to the queue.
         std::vector<WorkerBatch> pending(n);
-        while (auto batch = source_->Next()) {
+        while (!cancelled.load()) {
+            auto batch = source_->Next();
+            if (!batch) break;
             for (auto& p : pending) p.clear();
             // Accumulate this source batch into per-worker vectors in source
             // order. DATA goes to exactly one worker; CONTROL is appended to
@@ -175,7 +206,7 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
                     if constexpr (std::is_same_v<T, Record>) {
                         // DATA: exactly one worker, chosen by portable key hash.
                         uint32_t p = PartitionForKey(v.key, n);
-                        pending[p].push_back(WorkerMessage{v});
+                        pending[p].push_back(WorkerMessage{std::move(v)});
                     } else if constexpr (std::is_same_v<T, ControlRecord>) {
                         // CONTROL: broadcast to ALL workers so every worker
                         // fires against the identical GLOBAL watermark.
@@ -190,13 +221,7 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
             for (uint32_t p = 0; p < n; ++p) {
                 if (pending[p].empty()) continue;
                 bool pushed = workers[p]->queue.Push(std::move(pending[p]));
-                // The consumer only Close()s after the Router finishes, so Push
-                // can never observe a closed queue here. Assert rather than
-                // silently drop: a dropped batch would corrupt this partition's
-                // result set with no other signal — and result-set integrity is
-                // the whole project thesis.
-                assert(pushed && "worker queue closed before Router finished");
-                (void)pushed;
+                if (!pushed) return;  // cancellation closed all queues
             }
         }
         // Source exhausted: in-band end sentinel (its own final batch) to each
@@ -204,16 +229,18 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
         for (uint32_t p = 0; p < n; ++p) {
             bool pushed =
                 workers[p]->queue.Push(WorkerBatch{WorkerMessage{EndOfStream{}}});
-            assert(pushed && "worker queue closed before EndOfStream");
-            (void)pushed;
+            if (!pushed) return;
             workers[p]->queue.Close();
         }
+      } catch (...) { fail(); }
     });
 
     router.join();
     for (uint32_t i = 0; i < n; ++i) {
         workers[i]->thread.join();
     }
+
+    if (error) std::rethrow_exception(error);
 
     // --- Merge: union worker outputs into the caller's sink + aggregate stats ---
     stats.num_workers = n;
