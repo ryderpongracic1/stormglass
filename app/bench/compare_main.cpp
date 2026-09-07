@@ -22,18 +22,20 @@ namespace {
 
 constexpr std::array<char, 8> kMagic{'S','G','F','X','v','0','0','1'};
 
-uint32_t ReadU32(std::istream& in) {
-    std::array<unsigned char, 4> b{};
-    in.read(reinterpret_cast<char*>(b.data()), b.size());
-    if (!in) throw std::runtime_error("truncated fixture");
+uint32_t ReadU32(const std::vector<unsigned char>& bytes, std::size_t& cursor) {
+    if (cursor > bytes.size() || bytes.size() - cursor < 4)
+        throw std::runtime_error("truncated fixture");
+    const auto* b = bytes.data() + cursor;
+    cursor += 4;
     return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) |
            (static_cast<uint32_t>(b[2]) << 16) | (static_cast<uint32_t>(b[3]) << 24);
 }
 
-uint64_t ReadU64(std::istream& in) {
-    std::array<unsigned char, 8> b{};
-    in.read(reinterpret_cast<char*>(b.data()), b.size());
-    if (!in) throw std::runtime_error("truncated fixture");
+uint64_t ReadU64(const std::vector<unsigned char>& bytes, std::size_t& cursor) {
+    if (cursor > bytes.size() || bytes.size() - cursor < 8)
+        throw std::runtime_error("truncated fixture");
+    const auto* b = bytes.data() + cursor;
+    cursor += 8;
     uint64_t v = 0;
     for (unsigned i = 0; i < 8; ++i) v |= static_cast<uint64_t>(b[i]) << (8 * i);
     return v;
@@ -46,13 +48,15 @@ struct FixtureHeader {
     uint64_t keys;
 };
 
-FixtureHeader ReadHeader(std::istream& in) {
-    std::array<char, 8> magic{};
-    in.read(magic.data(), magic.size());
-    if (!in || magic != kMagic) throw std::runtime_error("invalid fixture magic");
-    const auto version = ReadU32(in);
-    const auto header_size = ReadU32(in);
-    FixtureHeader h{ReadU64(in), ReadU64(in), static_cast<int64_t>(ReadU64(in)), ReadU64(in)};
+FixtureHeader ReadHeader(const std::vector<unsigned char>& bytes, std::size_t& cursor) {
+    if (bytes.size() < kMagic.size() ||
+        !std::equal(kMagic.begin(), kMagic.end(), bytes.begin()))
+        throw std::runtime_error("invalid fixture magic");
+    cursor = kMagic.size();
+    const auto version = ReadU32(bytes, cursor);
+    const auto header_size = ReadU32(bytes, cursor);
+    FixtureHeader h{ReadU64(bytes, cursor), ReadU64(bytes, cursor),
+                    static_cast<int64_t>(ReadU64(bytes, cursor)), ReadU64(bytes, cursor)};
     if (version != 1 || header_size != 48 || !h.records || !h.entries ||
         h.cycle_span_ms <= 0 || !h.keys || h.keys > std::numeric_limits<uint32_t>::max())
         throw std::runtime_error("unsupported fixture header");
@@ -64,7 +68,7 @@ public:
     FixtureSource(std::string path, uint64_t cycles, uint32_t batch_size)
         : path_(std::move(path)), cycles_(cycles), batch_size_(batch_size) {
         if (!cycles_ || !batch_size_) throw std::invalid_argument("cycles and batch size must be positive");
-        OpenCycle();
+        LoadFixture();
     }
 
     std::optional<Batch> Next() override {
@@ -75,16 +79,18 @@ public:
             if (entry_ == header_.entries) {
                 ++cycle_;
                 if (cycle_ == cycles_) break;
-                OpenCycle();
+                cursor_ = header_size_;
+                entry_ = 0;
                 continue;
             }
-            const auto type = static_cast<uint8_t>(in_.get());
-            char padding[3];
-            in_.read(padding, sizeof(padding));
-            const uint32_t key_id = ReadU32(in_);
-            const int64_t value = static_cast<int64_t>(ReadU64(in_));
-            const int64_t event_or_watermark = static_cast<int64_t>(ReadU64(in_));
-            const uint64_t sequence = ReadU64(in_);
+            if (cursor_ > bytes_.size() || bytes_.size() - cursor_ < 4)
+                throw std::runtime_error("truncated fixture");
+            const auto type = bytes_[cursor_];
+            cursor_ += 4;  // type plus three reserved bytes
+            const uint32_t key_id = ReadU32(bytes_, cursor_);
+            const int64_t value = static_cast<int64_t>(ReadU64(bytes_, cursor_));
+            const int64_t event_or_watermark = static_cast<int64_t>(ReadU64(bytes_, cursor_));
+            const uint64_t sequence = ReadU64(bytes_, cursor_);
             ++entry_;
             const auto shift = static_cast<int64_t>(cycle_) * header_.cycle_span_ms;
             if (type == 0) {
@@ -108,26 +114,30 @@ public:
     [[nodiscard]] uint64_t LogicalRecords() const { return header_.records * cycles_; }
 
 private:
-    void OpenCycle() {
-        in_.close();
-        in_.clear();
-        in_.open(path_, std::ios::binary);
-        if (!in_) throw std::runtime_error("cannot open fixture: " + path_);
-        header_ = ReadHeader(in_);
-        if (keys_.empty()) {
-            keys_.reserve(header_.keys);
-            for (uint64_t key_id = 0; key_id < header_.keys; ++key_id) {
-                char key[24];
-                std::snprintf(key, sizeof(key), "key-%04llu",
-                              static_cast<unsigned long long>(key_id));
-                keys_.emplace_back(key);
-            }
-        } else if (keys_.size() != header_.keys) {
-            throw std::runtime_error("fixture header changed between cycles");
+    void LoadFixture() {
+        std::ifstream in(path_, std::ios::binary | std::ios::ate);
+        if (!in) throw std::runtime_error("cannot open fixture: " + path_);
+        const auto end = in.tellg();
+        if (end < 0) throw std::runtime_error("cannot size fixture: " + path_);
+        bytes_.resize(static_cast<std::size_t>(end));
+        in.seekg(0);
+        in.read(reinterpret_cast<char*>(bytes_.data()), static_cast<std::streamsize>(bytes_.size()));
+        if (!in) throw std::runtime_error("cannot read fixture: " + path_);
+        header_ = ReadHeader(bytes_, cursor_);
+        header_size_ = cursor_;
+        constexpr uint64_t kEntryBytes = 32;
+        if (header_.entries > (std::numeric_limits<uint64_t>::max() - header_size_) / kEntryBytes ||
+            header_size_ + header_.entries * kEntryBytes != bytes_.size())
+            throw std::runtime_error("fixture size does not match its header");
+        keys_.reserve(header_.keys);
+        for (uint64_t key_id = 0; key_id < header_.keys; ++key_id) {
+            char key[24];
+            std::snprintf(key, sizeof(key), "key-%04llu",
+                          static_cast<unsigned long long>(key_id));
+            keys_.emplace_back(key);
         }
         if (header_.records > std::numeric_limits<uint64_t>::max() / cycles_)
             throw std::overflow_error("logical record count overflow");
-        entry_ = 0;
     }
 
     std::string path_;
@@ -138,7 +148,9 @@ private:
     uint64_t offset_ = 0;
     FixtureHeader header_{};
     std::vector<std::string> keys_;
-    std::ifstream in_;
+    std::vector<unsigned char> bytes_;
+    std::size_t cursor_ = 0;
+    std::size_t header_size_ = 0;
 };
 
 uint64_t Mix(uint64_t z) {

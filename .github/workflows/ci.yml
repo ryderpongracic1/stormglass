@@ -74,7 +74,7 @@ jobs:
       - name: Verify heavy-disorder late drops
         run: |
           python3 bench/fixture/generate_fixture.py \
-            --output /tmp/heavy.sgfx --records 10000 --keys 1000 \
+            --output /tmp/heavy.sgfx --records 100000 --keys 1000 \
             --watermark-interval 500 --max-disorder-ms 5000 \
             --profile heavy --late-percent 10 --late-tail-ms 4000
           mkdir -p /tmp/heavy-results

@@ -9,6 +9,11 @@ The digest is an order-independent pair (XOR and wrapping sum) over every
 emitted `(key, window-start, window-end, sum, count)` tuple. A valid comparison
 requires equal record counts, output counts, and both digest fields.
 
+The fixture stores stormglass's exclusive event-time frontier. The Flink source
+subtracts one millisecond when emitting it because Flink watermarks are
+inclusive timestamps and its tumbling-window trigger is the window's `end - 1`.
+This maps both APIs to the same logical frontier at millisecond resolution.
+
 ## macOS setup
 
 The scripts require Homebrew OpenJDK 17 and Maven. Maven resolves the official

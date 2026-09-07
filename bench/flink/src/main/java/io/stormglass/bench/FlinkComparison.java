@@ -128,7 +128,12 @@ public final class FlinkComparison {
                                     Math.addExact(eventOrWatermark, shift), keyHashes[keyId]);
                                 context.collectWithTimestamp(event, event.eventTimeMs);
                             } else if (type == 1) {
-                                context.emitWatermark(new Watermark(Math.addExact(eventOrWatermark, shift)));
+                                // stormglass stores an exclusive frontier: W closes
+                                // [start, end) when W >= end. Flink watermarks are
+                                // inclusive timestamps and fire at end - 1, so shift
+                                // the representation by one millisecond.
+                                long frontier = Math.addExact(eventOrWatermark, shift);
+                                context.emitWatermark(new Watermark(Math.subtractExact(frontier, 1)));
                             } else {
                                 throw new IOException("invalid fixture entry type " + type);
                             }
