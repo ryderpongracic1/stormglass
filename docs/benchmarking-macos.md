@@ -84,8 +84,8 @@ Match at least these variables:
 
 Flink runs on a JVM, so include JVM version, heap size, garbage collector, TaskManager slots, operator chaining, object-reuse setting, and whether serialization or networking is bypassed. A single-process native microbenchmark and a full Flink runtime answer different questions. Present the comparison as architectural overhead under a controlled workload, not as a general claim that one engine is faster.
 
-For a credible follow-up, add a small Flink DataStream job that reads the exact same binary fixture as stormglass, emits no external output, and validates a checksum of final window results. Keep that benchmark in a separate directory with its own build and raw result files so the C++ codebase does not acquire a JVM dependency for ordinary builds.
-
 The matched comparator is available in [`bench/flink`](../bench/flink/README.md).
 It pins Flink 2.3.0 and Java 17, drives both engines from the same binary fixture,
-and requires equal output digests before their throughput numbers are compared.
+requires equal output digests before their throughput numbers are compared, and
+stores its raw results separately from ordinary C++ builds. Published results
+and their limitations are summarized in [benchmarks.md](benchmarks.md).

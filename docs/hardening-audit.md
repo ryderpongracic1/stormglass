@@ -1,5 +1,9 @@
 # Stormglass hardening audit — 2026-09-06
 
+This is the dated record of the hardening review. See the project
+[README](../README.md) and the focused documents in this directory for the
+current architecture, evidence, and benchmark summary.
+
 Audited upstream `abf9a53a9a47c6f6e8471f95da9518da9de1f1d9`. Validation host: macOS 26.6.2 (25G83), arm64, Apple Clang 21.0.0, C++20, CMake Release for benchmarks and Debug for sanitizers. No CPU affinity or exclusive machine reservation was used. The benchmark's printed Xeon reference and 4-vCPU oversubscription sentence are historical labels, not detected hardware.
 
 ## Verdict
@@ -37,7 +41,7 @@ Tests were added in `test/hardening_test.cpp`; the hardening commit includes all
 1. Restore chooses a common offset for which every requested partition has a CRC-valid file. This is a **recovery selection rule**, not a transactional global checkpoint commit manifest. Reload failure now aborts instead of silently restoring an empty partition.
 2. Recovery assumes a single job owns the checkpoint directory and that source identity/order/configuration, worker count, windowing, lateness and barrier cadence remain stable. There is no persisted job configuration fingerprint, source offset vector for a real broker, rescaling protocol, or multi-process writer lock. CRC proves byte integrity, not that two jobs or configurations have compatible state.
 3. Default MemorySink output is volatile and merges only after joining. DurableFileSink is a crash-test sink that truncates its path when constructed. The harness deliberately uses distinct pre-crash and post-restore files and preserves their union. Restarting against the same sink filename can erase earlier output. Checkpointing alone does not protect output already emitted to an arbitrary sink.
-4. There is no input event ID or input deduplication: repeated delivery of the same Record is another contribution. Output replay duplicates are expected. End-to-end exactly-once requires replayable sources and a transactional or appropriately versioned idempotent sink coordinated with checkpoint progress. A key-only upsert is insufficient if an older replay can overwrite a newer late-window revision. See the [Flink fault-tolerance documentation](https://github.com/apache/flink/blob/master/docs/content/docs/learn-flink/fault_tolerance.md), consulted through Context7.
+4. There is no input event ID or input deduplication: repeated delivery of the same Record is another contribution. Output replay duplicates are expected. End-to-end exactly-once requires replayable sources and a transactional or appropriately versioned idempotent sink coordinated with checkpoint progress. A key-only upsert is insufficient if an older replay can overwrite a newer late-window revision. See the [Flink fault-tolerance documentation](https://github.com/apache/flink/blob/master/docs/content/docs/learn-flink/fault_tolerance.md).
 5. The tests inject process SIGKILL, not power loss. File and directory fsync improve checkpoint durability, but there is no end-to-end machine-crash experiment or transactional sink proof. Sink output has length framing, not CRC protection. New directory-entry durability and arbitrary storage faults remain outside the tested guarantee.
 6. Readers accept checkpoint versions 1–3. Versions 1/2 cannot reconstruct pending re-fire information they never stored. A new v3 checkpoint is needed for the repaired guarantee; do not describe old late-data snapshots as retroactively repaired.
 7. Partition checkpoint history now grows without automatic pruning, and recovery scans grow with it. Error cancellation cannot interrupt a custom Source::Next that blocks indefinitely; the Source API has no cancellation hook. Neither unbounded external blocking nor hostile sources are modeled by these tests.
@@ -48,7 +52,7 @@ These boundaries make a transactional, broker-integrated, end-to-end exactly-onc
 
 * **153/153 Release tests passed.** Ten new tests supplement the upstream 143.
 * **ASan/UBSan, arm64:** full 151-test suite passed, then all ten hardening tests passed after two format tests were added. All 153 distinct tests are covered; unchanged tests were not unnecessarily rerun.
-* **TSan, arm64:** full 151-test suite passed with no race reports, then all ten hardening tests passed after the two format tests were added. All 153 distinct tests are covered. Linux/x86-64 TSan is configured in CI but was not executed for this local patch.
+* **TSan:** the local arm64 audit run covered all 153 distinct tests without a race report. Subsequent CI runs execute the complete suite under TSan on Linux x86-64 and macOS arm64.
 * **26 fresh confirmed SIGKILL scenarios passed:** 7 between checkpoints, 7 during checkpoint writes, 7 with torn partition sets, and 5 mid-alignment. Zero missing results across all scenarios. The harness observed **771 replay duplicates** (91 + 350 + 330 + 0). Retries used to land a particular failure point are recorded in the logs; 26 is the number of successful scenario runs, not a claim that exactly 26 child processes were launched.
 * All five mid-alignment scenarios had zero duplicates and **zero pre-crash emits**. This supports recovery from partial alignment, not exactly-once behavior across an already-visible output boundary.
 * Historical 44–56% hand-off overhead reduction appears in the upstream README and commit message; this audit did not reproduce that before/after experiment. It is omitted from the approved claims.
@@ -95,7 +99,7 @@ Final differential runs:
 | 143 tests | Now 153 passing tests. |
 | 100 seeds × 10K, cross-N, zero mismatches | Reproduced for both tumbling and sliding with heavy-tailed disorder and L=2s. |
 | 26 fork+SIGKILL runs, zero missing output | Reproduced as 26 successful scenario runs in the durable pre/post-output union harness; replay duplicates occurred. |
-| TSan-clean x86-64 and arm64 | Current patch verified on arm64 only. x86-64 was an upstream claim; new CI job is configured but unexecuted here. |
+| TSan-clean x86-64 and arm64 | The audit directly verified arm64; subsequent Linux x86-64 and macOS arm64 TSan CI jobs pass the complete suite. |
 | Correct through duplicate delivery / exactly-once | Not supported as a general guarantee; input duplicates are not deduplicated, output replays duplicate, and sinks do not transact with checkpoints. |
 
 ## Reproduction
