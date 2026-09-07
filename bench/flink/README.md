@@ -65,6 +65,27 @@ After the runs, `summarize_results.py` rejects any mismatch in records, emitted
 windows, late drops, or either digest. It then prints median throughput, the
 observed range, and the stormglass/Flink ratio for each parallelism.
 
+## Reference result: Apple M1 Max
+
+Commit `6955b13` was measured on a 10-core Apple M1 Max with 32 GiB RAM,
+macOS 26.6.2, OpenJDK 17.0.16, and Flink 2.3.0. Each cell is the median of three
+measured 100-million-record jobs after a warm-up. The workload used 1,000 keys,
+bounded 5-second out-of-order arrival, a watermark every 500 records, 1-second
+tumbling sum/count windows, zero allowed lateness, and checkpointing disabled.
+
+| Parallelism | stormglass M rec/s | Flink M rec/s | stormglass / Flink |
+|---:|---:|---:|---:|
+| 1 | 9.071 (9.025–9.252) | 1.964 (1.945–1.992) | 4.62x |
+| 2 | 14.029 (14.022–14.066) | 3.623 (3.503–3.783) | 3.87x |
+| 4 | 30.023 (29.948–30.286) | 6.593 (6.425–6.985) | 4.55x |
+| 8 | 28.227 (28.196–28.475) | 6.984 (6.789–7.182) | 4.04x |
+
+Every measured job consumed 100,000,000 records and emitted 66,843,149 window
+results with zero late drops, digest XOR `320d80c21c0b88e6`, and digest sum
+`5f1326cbfb8a0660`. The comparison measures single-host execution with an
+in-memory digest sink. It does not measure distributed network shuffle,
+durable sinks, or checkpoint overhead.
+
 This workload has checkpointing disabled. Compare checkpoint cost separately:
 Flink checkpoints are scheduled by elapsed time, while the current stormglass
 benchmark injects barriers by record count. The two should be normalized by
