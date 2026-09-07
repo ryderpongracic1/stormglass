@@ -38,3 +38,51 @@ jobs:
         run: cmake --build build-tsan --parallel 4
       - name: Test
         run: ctest --test-dir build-tsan --output-on-failure --timeout 120
+  flink-comparator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Build stormglass comparator
+        run: |
+          cmake -B build-compare -DCMAKE_BUILD_TYPE=Release -DSTORMGLASS_BENCH=ON
+          cmake --build build-compare --parallel 4 --target stormglass_compare
+      - name: Build Flink 2.3 comparator
+        run: |
+          mvn -f bench/flink/pom.xml --batch-mode --no-transfer-progress package
+          mvn -f bench/flink/pom.xml --batch-mode --no-transfer-progress \
+            dependency:build-classpath -DincludeScope=compile \
+            -Dmdep.outputFile="$PWD/bench/flink/target/classpath.txt"
+      - name: Verify matched results
+        run: |
+          python3 bench/fixture/generate_fixture.py \
+            --output /tmp/comparison.sgfx --records 10000 --keys 1000 \
+            --watermark-interval 500 --max-disorder-ms 5000
+          mkdir -p /tmp/comparison-results
+          build-compare/app/stormglass_compare \
+            --fixture /tmp/comparison.sgfx --cycles 2 --parallelism 2 \
+            > /tmp/comparison-results/stormglass-n2-run1.txt
+          java -cp "bench/flink/target/classes:$(cat bench/flink/target/classpath.txt)" \
+            io.stormglass.bench.FlinkComparison \
+            --fixture /tmp/comparison.sgfx --cycles 2 --parallelism 2 \
+            > /tmp/comparison-results/flink-n2-run1.txt
+          python3 bench/flink/summarize_results.py /tmp/comparison-results
+      - name: Verify heavy-disorder late drops
+        run: |
+          python3 bench/fixture/generate_fixture.py \
+            --output /tmp/heavy.sgfx --records 10000 --keys 1000 \
+            --watermark-interval 500 --max-disorder-ms 5000 \
+            --profile heavy --late-percent 10 --late-tail-ms 4000
+          mkdir -p /tmp/heavy-results
+          build-compare/app/stormglass_compare \
+            --fixture /tmp/heavy.sgfx --cycles 2 --parallelism 2 \
+            > /tmp/heavy-results/stormglass-n2-run1.txt
+          java -cp "bench/flink/target/classes:$(cat bench/flink/target/classpath.txt)" \
+            io.stormglass.bench.FlinkComparison \
+            --fixture /tmp/heavy.sgfx --cycles 2 --parallelism 2 \
+            > /tmp/heavy-results/flink-n2-run1.txt
+          python3 bench/flink/summarize_results.py /tmp/heavy-results

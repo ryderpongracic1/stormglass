@@ -3,3 +3,9 @@ build-*/
 cmake-build-*/
 .cache/
 compile_commands.json
+__pycache__/
+*.pyc
+bench/data/
+bench/flink/.flink/
+bench/flink/target/
+bench/results/
