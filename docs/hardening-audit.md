@@ -1,5 +1,7 @@
 # Stormglass hardening audit — 2026-09-06
 
+> Historical audit from 2026-09-06. For current resume wording and the corrected comparison methodology, see [approved claims](approved-claims.md) and [benchmarks](benchmarks.md). The approved text below describes that earlier workload, not the latest benchmark.
+
 This is the dated record of the hardening review. See the project
 [README](../README.md) and the focused documents in this directory for the
 current architecture, evidence, and benchmark summary.

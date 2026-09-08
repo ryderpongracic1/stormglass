@@ -14,7 +14,7 @@ xcrun clang++ --version
 cmake --version
 ```
 
-Apple Silicon may return an empty CPU brand string. In that case, record the Mac model from **System Settings → General → About**. Do not reuse the hardware description printed by the benchmark executable; it is historical text rather than runtime detection.
+Apple Silicon may return an empty CPU brand string. In that case, record the Mac model from **System Settings → General → About**. The benchmark executable labels results as coming from the current host; hardware metadata must accompany retained logs.
 
 ## Build and validate
 
@@ -86,6 +86,50 @@ Flink runs on a JVM, so include JVM version, heap size, garbage collector, TaskM
 
 The matched comparator is available in [`bench/flink`](../bench/flink/README.md).
 It pins Flink 2.3.0 and Java 17, drives both engines from the same binary fixture,
-requires equal output digests before their throughput numbers are compared, and
+requires actual/expected record counts and equal output digests before their throughput numbers are compared, and
 stores its raw results separately from ordinary C++ builds. Published results
 and their limitations are summarized in [benchmarks.md](benchmarks.md).
+
+## Comparison timing and evidence gate
+
+The comparison is restricted to **zero allowed lateness**. Stormglass coalesces
+pending late re-fires until a watermark; Flink can emit each late update. A
+nonzero-lateness result stream would therefore not be the same workload.
+
+The `timing=execute` interval includes native fixture loading, pipeline setup,
+execution, and digest reduction. Flink uses wall time around `env.execute()`
+through result retrieval, including local job startup, fixture mapping and
+execution. Command-line parsing and process launch are excluded; Flink graph
+construction is excluded. These are explicit local execution boundaries, not
+identical instruction paths or steady-state operator-only timings.
+
+Each Flink trial starts a fresh JVM with `-Xms1g -Xmx4g -XX:+UseG1GC`. The
+separate two-cycle warm-up process warms filesystem/OS caches but **does not
+warm the measured JVM's JIT**. Compilation and GC during execution remain in
+the measurements. Flink retains its default local runtime configuration, key
+partitioning, chaining and transport, with object reuse requested; no custom
+Flink tuning search was performed. Native uses FNV-1a partitioning and batched
+in-process queues. Equal results do not imply equal serialization or scheduling
+work, equal CPU consumption, or a universally faster engine.
+
+The runner rebuilds both implementations, records binary hashes, tracked-diff
+hash, build configuration, fixture SHA-256, heap/GC settings, and the expected
+run matrix. It alternates engine order between repetitions and stops on failed
+commands even when output is piped through `tee`. A private fixture per run
+prevents concurrent invocations from overwriting one another's input. Hardware
+is not exclusively reserved and macOS core affinity is not controlled.
+
+The summarizer rejects missing/duplicate fields, missing jobs, mismatched
+workloads, incorrect actual/expected counts, invalid timings, and any output
+count/drop/digest disagreement across repetitions or worker counts. Two
+64-bit digests are a probabilistic multiset check, not a proof of output
+identity. This comparison does not validate crash recovery.
+
+Run the benchmark regression checks separately from timed measurements:
+
+```sh
+python3 -m unittest discover -s bench/flink -p 'test_summarize_results.py'
+python3 bench/flink/test_comparison_inputs.py \
+  --stormglass build-release/app/stormglass_compare \
+  --java-classpath "bench/flink/target/classes:$(cat bench/flink/target/classpath.txt)"
+```

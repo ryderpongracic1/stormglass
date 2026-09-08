@@ -68,7 +68,7 @@ SourceMerge::StepResult SourceMerge::ProduceOneMergedStep(Batch& out,
         // the OPEN epoch is BLOCKED. Its records stay buffered (unpulled in st.buf,
         // st.cursor not advanced past the barrier) and it is skipped in the round-
         // robin until every active channel aligns and the epoch closes. This is the
-        // Chandy-Lamport "block the early channel" step.
+        // Aligned-checkpoint "block the early channel" step.
         if (IsChannelBlocked(i)) continue;
 
         // --- v3 Phase 2 idle-span modeling ---

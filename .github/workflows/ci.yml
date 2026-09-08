@@ -57,6 +57,13 @@ jobs:
           mvn -f bench/flink/pom.xml --batch-mode --no-transfer-progress \
             dependency:build-classpath -DincludeScope=compile \
             -Dmdep.outputFile="$PWD/bench/flink/target/classpath.txt"
+      - name: Validate benchmark evidence parser
+        run: python3 -m unittest discover -s bench/flink -p 'test_summarize_results.py'
+      - name: Reject invalid comparison inputs
+        run: |
+          python3 bench/flink/test_comparison_inputs.py \
+            --stormglass build-compare/app/stormglass_compare \
+            --java-classpath "bench/flink/target/classes:$(cat bench/flink/target/classpath.txt)"
       - name: Verify matched results
         run: |
           python3 bench/fixture/generate_fixture.py \

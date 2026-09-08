@@ -4,6 +4,11 @@ stormglass checkpoints operator state at in-band barriers and restores from the
 newest complete common partition cut. The tested guarantee is at-least-once
 state recovery under deterministic source replay.
 
+This document describes the native aligned-barrier mode. The separate
+[Chandy–Lamport TCP mode](chandy-lamport.md) records nonempty in-flight channel
+state and uses a global commit manifest; its source and topology contract is
+different.
+
 ## Barrier alignment
 
 Each input source emits monotonically numbered barriers. `SourceMerge` blocks a

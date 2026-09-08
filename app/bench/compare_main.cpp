@@ -3,6 +3,7 @@
 #include "source/source.h"
 #include "window/tumbling.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -90,14 +91,17 @@ public:
             const uint32_t key_id = ReadU32(bytes_, cursor_);
             const int64_t value = static_cast<int64_t>(ReadU64(bytes_, cursor_));
             const int64_t event_or_watermark = static_cast<int64_t>(ReadU64(bytes_, cursor_));
-            const uint64_t sequence = ReadU64(bytes_, cursor_);
+            (void)ReadU64(bytes_, cursor_);  // fixture sequence is not part of window semantics
             ++entry_;
             const auto shift = static_cast<int64_t>(cycle_) * header_.cycle_span_ms;
+            if (event_or_watermark < 0 || event_or_watermark >
+                std::numeric_limits<int64_t>::max() - shift - 1000)
+                throw std::overflow_error("fixture timestamp outside supported window domain");
             if (type == 0) {
                 if (key_id >= keys_.size()) throw std::runtime_error("fixture key id out of range");
                 batch.items.emplace_back(Record{
                     keys_[key_id], value, Timestamp{Duration{event_or_watermark + shift}},
-                    Timestamp{Duration{static_cast<int64_t>(sequence + cycle_ * header_.records)}}});
+                    Timestamp{Duration{static_cast<int64_t>(offset_)}}});
                 ++offset_;
             } else if (type == 1) {
                 batch.items.emplace_back(ControlRecord{ControlType::kWatermark,
@@ -129,6 +133,8 @@ private:
         if (header_.entries > (std::numeric_limits<uint64_t>::max() - header_size_) / kEntryBytes ||
             header_size_ + header_.entries * kEntryBytes != bytes_.size())
             throw std::runtime_error("fixture size does not match its header");
+        if (cycles_ - 1 > static_cast<uint64_t>(std::numeric_limits<int64_t>::max() / header_.cycle_span_ms))
+            throw std::overflow_error("fixture cycle timestamp overflow");
         keys_.reserve(header_.keys);
         for (uint64_t key_id = 0; key_id < header_.keys; ++key_id) {
             char key[24];
@@ -136,7 +142,7 @@ private:
                           static_cast<unsigned long long>(key_id));
             keys_.emplace_back(key);
         }
-        if (header_.records > std::numeric_limits<uint64_t>::max() / cycles_)
+        if (header_.records > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / cycles_)
             throw std::overflow_error("logical record count overflow");
     }
 
@@ -214,13 +220,23 @@ int main(int argc, char** argv) try {
         };
         if (arg == "--fixture") fixture = value();
         else if (arg == "--cycles") cycles = std::stoull(value());
-        else if (arg == "--parallelism") workers = static_cast<uint32_t>(std::stoul(value()));
+        else if (arg == "--parallelism") {
+            const auto parsed = std::stoull(value());
+            if (parsed > std::numeric_limits<uint32_t>::max())
+                throw std::invalid_argument("parallelism exceeds uint32 range");
+            workers = static_cast<uint32_t>(parsed);
+        }
         else if (arg == "--lateness-ms") lateness_ms = std::stoll(value());
         else throw std::invalid_argument("unknown argument: " + arg);
     }
-    if (fixture.empty() || !workers || lateness_ms < 0)
+    if (lateness_ms != 0)
+        throw std::invalid_argument("matched comparison requires zero allowed lateness (refire policies differ)");
+    if (fixture.empty() || !workers)
         throw std::invalid_argument("usage: stormglass_compare --fixture PATH [--cycles N] [--parallelism N] [--lateness-ms N]");
 
+    // Nonzero lateness has different refire granularity in the two engines.
+    // Keep the matched comparison restricted to zero allowed lateness.
+    const auto started = std::chrono::steady_clock::now();
     auto source = std::make_unique<FixtureSource>(fixture, cycles, 4096);
     const auto logical_records = source->LogicalRecords();
     std::vector<SharedDigest> worker_digests(workers);
@@ -235,17 +251,17 @@ int main(int argc, char** argv) try {
         [] { return std::make_unique<TumblingAssigner>(Duration{1000}); },
         std::move(sink), config);
 
-    const auto started = std::chrono::steady_clock::now();
     const auto stats = pipeline.Run();
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     uint64_t outputs = 0, digest_xor = 0, digest_sum = 0;
     for (const auto& digest : worker_digests) {
         outputs += digest.outputs;
         digest_xor ^= digest.digest_xor;
         digest_sum += digest.digest_sum;
     }
-    std::cout << "engine=stormglass records=" << stats.records_processed
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::cout << "engine=stormglass timing=execute window_ms=1000 records=" << stats.records_processed
               << " expected_records=" << logical_records << " parallelism=" << workers
+              << " lateness_ms=" << lateness_ms << " cycles=" << cycles
               << " seconds=" << std::fixed << std::setprecision(6) << elapsed
               << " m_records_per_second=" << std::setprecision(3)
               << (static_cast<double>(stats.records_processed) / elapsed / 1e6)

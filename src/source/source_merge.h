@@ -110,7 +110,7 @@ struct SourceMergeConfig {
     //
     // v3 Phase 3: SourceMerge is NO LONGER a single barrier origin. Each wrapped
     // source emits its OWN kCheckpointBarrier at its own record offsets, and
-    // SourceMerge performs real K-way Chandy-Lamport ALIGNMENT: when barrier N
+    // SourceMerge performs K-way barrier ALIGNMENT: when barrier N
     // arrives early on a channel, that channel is BLOCKED (its subsequent records
     // buffered — not pulled past the barrier) until barrier N has arrived on every
     // ACTIVE channel; only then is ONE merged barrier — stamped with the merged
@@ -151,7 +151,7 @@ struct SourceMergeConfig {
 ///     identical merged sequence (O(O), the same documented replay cost the
 ///     single generator's Seek pays).
 ///   * Barriers (v3 Phase 3): each wrapped source emits its OWN barriers; Source-
-///     Merge aligns them K-way (Chandy-Lamport). When barrier N arrives early on a
+///     Merge aligns them K-way. When barrier N arrives early on a
 ///     channel, that channel is BLOCKED (its records buffered — left unpulled — not
 ///     advanced past the barrier) until barrier N has arrived on every ACTIVE
 ///     channel; then ONE merged barrier, stamped with the aligned cut's merged

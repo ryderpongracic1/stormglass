@@ -18,3 +18,9 @@ target_link_libraries(stormglass_oracle PRIVATE stormglass_lib)
 
 add_executable(stormglass_nemesis nemesis/main.cpp)
 target_link_libraries(stormglass_nemesis PRIVATE stormglass_lib)
+
+add_executable(stormglass_snapshot_demo snapshot/main.cpp)
+target_link_libraries(stormglass_snapshot_demo PRIVATE stormglass_lib)
+add_test(NAME TcpSnapshot.ProcessRecovery COMMAND stormglass_snapshot_demo)
+add_test(NAME TcpSnapshot.MidMarkerCrashRecovery COMMAND stormglass_snapshot_demo --crash)
+set_tests_properties(TcpSnapshot.ProcessRecovery TcpSnapshot.MidMarkerCrashRecovery PROPERTIES TIMEOUT 45)

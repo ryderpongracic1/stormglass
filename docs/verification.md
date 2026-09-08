@@ -1,8 +1,8 @@
 # Verification
 
 stormglass uses deterministic generation, an independent aggregation oracle,
-direct protocol tests, fault injection, and sanitizers. The suite contains 153
-GoogleTest cases.
+direct protocol tests, fault injection, and sanitizers. The CTest suite contains 177 tests: 175
+GoogleTest cases and two separate-process TCP scenarios. Benchmark tooling has separate Python and executable regression checks; these are not included in that count.
 
 ## Differential oracle
 
@@ -96,7 +96,12 @@ GitHub Actions runs:
 - Release benchmarks plus oracle and nemesis smoke runs;
 - the C++/Flink semantic comparator for bounded and heavy disorder.
 
-A sanitizer pass proves the exercised executions emitted no sanitizer report.
+At `40ffef6`, [CI run 34089133633](https://github.com/ryderpongracic1/stormglass/actions/runs/34089133633)
+completed successfully, including both ThreadSanitizer jobs. This verifies the
+existing engine suite on Linux x86-64 and macOS arm64; it is not a claim that
+uncommitted benchmark tooling has already passed remote CI.
+
+A sanitizer pass establishes that the exercised executions emitted no sanitizer report.
 It does not prove freedom from every possible schedule, leak, or external I/O
 failure.
 
@@ -132,3 +137,26 @@ cmake --build build-release --parallel
 ./build-release/app/stormglass_nemesis --partitioned --seeds 7 --verbose
 ./build-release/app/stormglass_nemesis --alignment-kill --seeds 5 --verbose
 ```
+
+## Benchmark validation
+
+The comparator counts source records in both engines and checks them against
+the fixture declaration. The report requires complete job pairs and verifies
+actual/expected counts, workload settings, output counts, late drops and both
+digests across repetitions and N. It rejects nonzero allowed lateness because
+the two engines use different re-fire granularity. Digest agreement is strong
+probabilistic evidence, not a mathematical proof of identical result streams.
+
+The benchmark checks include 14 Python report-validator tests and nine
+executable input checks (valid input, false fixture counts, nonzero lateness,
+invalid parallelism, and native cycle overflow). They run in the Flink CI job.
+
+## TCP Chandy–Lamport snapshots
+
+The new protocol has 24 focused tests: 22 GoogleTest cases and two TCP process
+scenarios. They cover marker rules, continued processing and in-flight capture,
+an independent token-conservation invariant under 100 randomized FIFO schedules,
+window/watermark restoration, global commit validation, corruption, sequence-aware
+replay, and recovery after a confirmed mid-marker SIGKILL. See the
+[protocol and exact test scope](chandy-lamport.md). These are separate from the
+original 26 native crash-harness scenarios and do not establish an exactly-once sink.

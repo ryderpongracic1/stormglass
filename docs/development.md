@@ -52,6 +52,7 @@ the requested instrumentation.
 | `stormglass_scanbench` | Isolates watermark cost as live-pane count and cadence change |
 | `stormglass_oracle` | Runs single-source, cross-N, and multi-source differential checks |
 | `stormglass_nemesis` | Runs checkpoint and process-kill recovery scenarios |
+| `stormglass_snapshot_demo` | Three TCP processes, channel snapshots, global commit and crash recovery |
 | `stormglass_compare` | Consumes the binary fixture used by the Flink comparison |
 
 Benchmark targets require `-DSTORMGLASS_BENCH=ON`.

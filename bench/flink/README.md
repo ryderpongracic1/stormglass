@@ -65,28 +65,31 @@ After the runs, `summarize_results.py` rejects any mismatch in records, emitted
 windows, late drops, or either digest. It then prints median throughput, the
 observed range, and the stormglass/Flink ratio for each parallelism.
 
-## Reference result: Apple M1 Max
+## Current reference results and timing
 
-Commit `6955b13` was measured on a 10-core Apple M1 Max with 32 GiB RAM,
-macOS 26.6.2, OpenJDK 17.0.16, and Flink 2.3.0. Each cell is the median of three
-measured 100-million-record jobs after a warm-up. The workload used 1,000 keys,
-bounded 5-second out-of-order arrival, a watermark every 500 records, 1-second
-tumbling sum/count windows, zero allowed lateness, and checkpointing disabled.
+The corrected 2026-09-07 run reached **27.499M records/s at N=8**, versus
+**7.474M for Flink** (3.68×), on the Apple M1 Max. At N=4, the medians were
+21.097M versus 6.409M (3.29×). See [all results, ranges and historical
+corrections](../../docs/benchmarks.md).
 
-| Parallelism | stormglass M rec/s | Flink M rec/s | stormglass / Flink |
-|---:|---:|---:|---:|
-| 1 | 9.071 (9.025–9.252) | 1.964 (1.945–1.992) | 4.62x |
-| 2 | 14.029 (14.022–14.066) | 3.623 (3.503–3.783) | 3.87x |
-| 4 | 30.023 (29.948–30.286) | 6.593 (6.425–6.985) | 4.55x |
-| 8 | 28.227 (28.196–28.475) | 6.984 (6.789–7.182) | 4.04x |
+The native timer includes fixture load/setup through digest reduction. Flink
+uses wall time around `env.execute()` through result retrieval. Each measured
+job starts in a fresh JVM (`-Xms1g -Xmx4g -XX:+UseG1GC`); the separate warm-up
+does not warm its JIT. Runtime setup, serialization, scheduling and GC are part
+of this local execution comparison, not evidence of equal runtime costs.
 
-Every measured job consumed 100,000,000 records and emitted 66,843,149 window
-results with zero late drops, digest XOR `320d80c21c0b88e6`, and digest sum
-`5f1326cbfb8a0660`. The comparison measures single-host execution with an
-in-memory digest sink. It does not measure distributed network shuffle,
-durable sinks, or checkpoint overhead.
+Only zero allowed lateness is supported by the comparison: native coalesced
+late re-fires differ from Flink's per-update emissions. Both executables reject
+nonzero `--lateness-ms`. Matching output counts and dual digests provide strong
+probabilistic agreement evidence; they do not prove exact stream identity.
 
-This workload has checkpointing disabled. Compare checkpoint cost separately:
-Flink checkpoints are scheduled by elapsed time, while the current stormglass
-benchmark injects barriers by record count. The two should be normalized by
-completed checkpoint count and state size before reporting a ratio.
+The runner requires a Release build without sanitizers and Java 17, rebuilds
+both executables, refreshes dependency classpaths, and executes the hashed JAR.
+It records fixture/binary/dependency hashes, configuration and an expected run
+matrix, alternates engine order, and stops on failed jobs. The summarizer checks
+all required fields, actual versus expected counts, workload settings, rates,
+and result signatures across all jobs. Local raw evidence remains ignored under
+`bench/results/`.
+
+This workload has checkpointing disabled. Checkpoint cost must be compared
+separately with matched completed checkpoint counts, state size and storage.

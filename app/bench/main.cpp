@@ -19,11 +19,12 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <vector>
 #include <unistd.h>
 
 using namespace stormglass;
-using Clock = std::chrono::high_resolution_clock;
+using Clock = std::chrono::steady_clock;
 
 static void BenchmarkPipeline(uint64_t num_records) {
     GeneratorConfig config;
@@ -86,8 +87,9 @@ static void BenchmarkCheckpoint() {
         auto start_t = Clock::now();
         for (int i = 0; i < kWrites; ++i) {
             CheckpointWriter writer(dir);
-            writer.WriteCheckpoint(static_cast<uint64_t>(i + 1) * 1000,
-                                   Timestamp{Duration{1000000}}, state);
+            if (!writer.WriteCheckpoint(static_cast<uint64_t>(i + 1) * 1000,
+                                        Timestamp{Duration{1000000}}, state))
+                throw std::runtime_error("checkpoint benchmark write failed");
         }
         auto end_t = Clock::now();
         double total_ms = std::chrono::duration<double, std::milli>(end_t - start_t).count();
@@ -96,8 +98,7 @@ static void BenchmarkCheckpoint() {
                   << kWrites << " writes incl. fsync + rename + dir-fsync)\n";
     }
 
-    std::string cmd = "rm -rf " + dir;
-    [[maybe_unused]] int rc = std::system(cmd.c_str());
+    std::filesystem::remove_all(dir);
     std::cout << "\n";
 }
 
@@ -113,6 +114,7 @@ namespace {
 // Median + observed min/max over a set of reps.
 struct Agg { double median = 0, lo = 0, hi = 0; };
 Agg Aggregate(std::vector<double> v) {
+    if (v.empty()) throw std::runtime_error("benchmark has no successful samples");
     std::sort(v.begin(), v.end());
     Agg a;
     a.lo = v.front();
@@ -177,9 +179,9 @@ static void BenchmarkScalingCurve() {
     constexpr int kReps = 7;
     std::cout << "=== Partitioned Scaling Curve ===\n";
     std::cout << "  Workload: 1M records, 1000 keys, tumbling 1s, MemorySink, no checkpointing\n";
-    std::cout << "  Hardware: this machine (README reference numbers: 4-vCPU shared Xeon 6975P-C). "
+    std::cout << "  Hardware: current host; capture environment separately. "
               << kReps << " reps; median (min-max) M rec/s\n";
-    std::cout << "  (Router thread + N workers + merge: N=4 and N=8 oversubscribe 4 vCPUs.)\n\n";
+    std::cout << "  (Router thread + N workers; N is worker count, not total thread count.)\n\n";
 
     {
         std::vector<double> v;
@@ -207,7 +209,7 @@ static void BenchmarkCheckpointOverhead() {
     std::cout << "=== Partitioned Checkpoint Overhead (N=" << kN << ") ===\n";
     std::cout << "  Workload: 1M records, 1000 keys, tumbling 1s; checkpoint interval "
               << kCkptInterval << " records\n";
-    std::cout << "  Hardware: this machine (README reference numbers: 4-vCPU shared Xeon 6975P-C). "
+    std::cout << "  Hardware: current host; capture environment separately. "
               << kReps << " reps; median (min-max) M rec/s\n\n";
 
     // OFF: reuse the no-checkpoint partitioned run at N.
@@ -221,7 +223,7 @@ static void BenchmarkCheckpointOverhead() {
     for (int i = 0; i < kReps; ++i) {
         char tmpl[] = "/tmp/stormglass_p4_ckpt_XXXXXX";
         char* d = ::mkdtemp(tmpl);
-        if (!d) continue;
+        if (!d) throw std::runtime_error("checkpoint benchmark mkdtemp failed");
         std::string dir = d;
         GeneratorConfig g = ScalingGenConfig();
         g.checkpoint_interval = kCkptInterval;
@@ -306,8 +308,8 @@ static void BenchmarkCheckpointOverhead() {
                 kN, astate.median, astate.lo, astate.hi);
     std::printf("  source Seek (in-memory generator, O(offset) replay): %8.0f us  (%.0f - %.0f)\n",
                 aseek.median, aseek.lo, aseek.hi);
-    std::printf("  [%d reps; a replayable-log source seeks in ~O(1) — the load line is the "
-                "portable restore cost]\n", kReps);
+    std::printf("  [%d reps; source seek cost depends on its implementation — the load line excludes "
+                "source seek]\n", kReps);
     std::cout << "\n";
 }
 
@@ -315,10 +317,10 @@ static void BenchmarkCheckpointOverhead() {
 // Multi-source benchmarks (v3 Phase 4). SourceMerge wraps K DeterministicGenerators
 // behind ONE Source pulled by ONE thread — alignment adds no new concurrency. These
 // measure the PRICE of the merge machinery and of K-way barrier alignment, holding
-// the TOTAL merged record count fixed so only K (and barriers on/off) varies, i.e.
-// the work is constant and the delta is the machinery. All numbers come from this
-// machine; the harness prints median + observed min/max. README reference machine:
-// 4-vCPU shared Intel Xeon 6975P-C. Reproduce with `make bench`.
+// the TOTAL merged record count approximately fixed. Varying K also changes the
+// event-time span, key distribution, and emitted windows; this is an end-to-end
+// workload comparison, not an isolated measurement of merge machinery. The
+// harness prints median + observed min/max. Reproduce with `make bench`.
 // ===========================================================================
 
 namespace {
@@ -326,12 +328,10 @@ namespace {
 constexpr uint64_t kMultiSourceTotal = 1'000'000;  // fixed merged DATA-record budget
 
 // Per-source generator config for the multi-source benches. event_time_step is held
-// UNIFORM across sources on purpose: it isolates the SourceMerge machinery (round-
-// robin pull + watermark interception/min-combine + K-way alignment) from windowing
-// divergence, so the K-vs-throughput delta is the merge cost, not a different set of
-// windows firing. (Divergent-rate CORRECTNESS is proven by the differential; this
-// bench measures COST.) Seeds diverge per source so keys/values are not identical
-// duplicate streams, while the event-time rate stays uniform.
+// UNIFORM across sources. Splitting records over K sources shortens the merged
+// event-time span and changes the windows emitted, so rate differences also include
+// windowing and sink costs. Seeds diverge per source; this is not a matched-output
+// experiment for attributing the rate difference solely to SourceMerge.
 GeneratorConfig MergeSrcConfig(uint64_t records, uint64_t seed) {
     GeneratorConfig c{};
     c.seed = seed;
@@ -384,17 +384,17 @@ double RunSourceMergeOnce(uint32_t k, uint64_t total, uint64_t barrier_interval,
 
 }  // namespace
 
-// Part B.1 — SourceMerge overhead at a fixed total record count (K varies, work
-// doesn't). Bare single-source Pipeline vs SourceMerge K in {1,2,3}.
+// Part B.1 — SourceMerge workloads at approximately fixed total input count.
+// Output/windowing work changes with K. Bare Pipeline vs SourceMerge K={1,2,3}.
 static void BenchmarkSourceMergeOverhead() {
     constexpr int kReps = 7;
-    std::cout << "=== Multi-Source: SourceMerge Overhead (fixed total) ===\n";
+    std::cout << "=== Multi-Source: End-to-End Throughput (approximately fixed input count) ===\n";
     std::printf("  Workload: %" PRIu64 " merged records total, split across K sources "
                 "(~total/K each), 1000 keys, tumbling 1s, MemorySink, no barriers\n",
                 kMultiSourceTotal);
-    std::cout << "  Hardware: this machine (README reference numbers: 4-vCPU shared Xeon 6975P-C). "
+    std::cout << "  Hardware: current host; capture environment separately. "
               << kReps << " reps; median (min-max) M rec/s\n";
-    std::cout << "  (Uniform per-source rate isolates merge machinery from windowing divergence.)\n\n";
+    std::cout << "  (Varying K changes event-time span and emitted windows; rates do not isolate merge cost.)\n\n";
 
     {
         std::vector<double> v;
@@ -418,14 +418,14 @@ static void BenchmarkSourceMergeOverhead() {
 
 // Part B.2 — K-way alignment cost: per-source barriers ON at a realistic interval
 // vs OFF, same fixed-total workload. checkpoint_dir empty => alignment machinery
-// only (no fsync). This is the price of Chandy-Lamport alignment itself.
+// only (no fsync). This measures deterministic single-process barrier handling.
 static void BenchmarkAlignmentCost() {
     constexpr int kReps = 7;
     std::cout << "=== Multi-Source: K-way Alignment Cost (barriers ON vs OFF) ===\n";
     std::printf("  Workload: %" PRIu64 " merged records total, 1000 keys, tumbling 1s, MemorySink; "
                 "checkpoint_dir empty (alignment machinery only, no fsync)\n",
                 kMultiSourceTotal);
-    std::cout << "  Hardware: this machine (README reference numbers: 4-vCPU shared Xeon 6975P-C). "
+    std::cout << "  Hardware: current host; capture environment separately. "
               << kReps << " reps; median (min-max) M rec/s\n\n";
 
     for (uint32_t k : {2u, 3u}) {

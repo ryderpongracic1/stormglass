@@ -79,6 +79,13 @@ public final class FlinkComparison {
         private final String fixture;
         private final long cycles;
         private volatile boolean running = true;
+        private transient LongCounter recordCount;
+
+        @Override
+        public void open(OpenContext openContext) {
+            recordCount = new LongCounter();
+            getRuntimeContext().addAccumulator("records", recordCount);
+        }
 
         FixtureSource(String fixture, long cycles) {
             this.fixture = fixture;
@@ -90,6 +97,7 @@ public final class FlinkComparison {
             if (getRuntimeContext().getTaskInfo().getIndexOfThisSubtask() != 0) {
                 throw new IllegalStateException("fixture source must have parallelism 1");
             }
+            long emittedRecords = 0;
             try (RandomAccessFile file = new RandomAccessFile(fixture, "r");
                  FileChannel channel = file.getChannel()) {
                 if (channel.size() > Integer.MAX_VALUE) {
@@ -127,6 +135,7 @@ public final class FlinkComparison {
                                 Event event = new Event(keys[keyId], value,
                                     Math.addExact(eventOrWatermark, shift), keyHashes[keyId]);
                                 context.collectWithTimestamp(event, event.eventTimeMs);
+                                ++emittedRecords;
                             } else if (type == 1) {
                                 // stormglass stores an exclusive frontier: W closes
                                 // [start, end) when W >= end. Flink watermarks are
@@ -142,6 +151,7 @@ public final class FlinkComparison {
                 }
                 synchronized (context.getCheckpointLock()) {
                     context.emitWatermark(new Watermark(Long.MAX_VALUE));
+                    recordCount.add(emittedRecords);
                 }
             }
         }
@@ -298,7 +308,10 @@ public final class FlinkComparison {
                     default -> throw new IllegalArgumentException("unknown argument: " + arg);
                 }
             }
-            if (fixture == null || cycles <= 0 || parallelism <= 0 || latenessMs < 0) {
+            if (latenessMs != 0) {
+                throw new IllegalArgumentException("matched comparison requires zero allowed lateness (refire policies differ)");
+            }
+            if (fixture == null || cycles <= 0 || parallelism <= 0) {
                 throw new IllegalArgumentException(
                     "usage: --fixture PATH [--cycles N] [--parallelism N] [--lateness-ms N]");
             }
@@ -328,6 +341,7 @@ public final class FlinkComparison {
         results.getSideOutput(late).addSink(new CountLateSink())
             .name("late-data-counter").setParallelism(args.parallelism);
 
+        long started = System.nanoTime();
         JobExecutionResult execution = env.execute("stormglass-flink-comparison");
         Header header;
         try (RandomAccessFile file = new RandomAccessFile(args.fixture, "r");
@@ -337,18 +351,25 @@ public final class FlinkComparison {
             bytes.flip();
             header = readHeader(bytes);
         }
-        long records = Math.multiplyExact(header.records, args.cycles);
+        long expectedRecords = Math.multiplyExact(header.records, args.cycles);
+        Long actualRecords = execution.getAccumulatorResult("records");
+        if (actualRecords == null || actualRecords != expectedRecords) {
+            throw new IllegalStateException("actual source record count does not match fixture header");
+        }
+        long records = actualRecords;
         long runtimeMs = execution.getNetRuntime();
+        if (runtimeMs <= 0) throw new IllegalStateException("nonpositive measured runtime");
         long outputs = execution.getAccumulatorResult("outputs");
         long digestXor = execution.getAccumulatorResult("digest_xor");
         long digestSum = execution.getAccumulatorResult("digest_sum");
         Long lateDroppedResult = execution.getAccumulatorResult("late_dropped");
         long lateDropped = lateDroppedResult == null ? 0 : lateDroppedResult;
-        double rate = records / (runtimeMs / 1_000.0) / 1_000_000.0;
+        double elapsedSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
+        double rate = records / elapsedSeconds / 1_000_000.0;
         System.out.printf(Locale.ROOT,
-            "engine=flink version=2.3.0 records=%d parallelism=%d seconds=%.6f " +
+            "engine=flink version=2.3.0 timing=execute window_ms=1000 records=%d expected_records=%d parallelism=%d lateness_ms=%d cycles=%d seconds=%.6f " +
             "m_records_per_second=%.3f outputs=%d late_dropped=%d digest_xor=%016x digest_sum=%016x%n",
-            records, args.parallelism, runtimeMs / 1_000.0, rate, outputs, lateDropped,
+            records, expectedRecords, args.parallelism, args.latenessMs, args.cycles, elapsedSeconds, rate, outputs, lateDropped,
             digestXor, digestSum);
     }
 }

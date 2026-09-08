@@ -4,12 +4,13 @@
 
 Built a C++20 event-time stream processor with keyed shared-nothing workers,
 tumbling and sliding windows, multi-source watermark coordination, aligned
-checkpoint recovery, and deterministic fault testing.
+checkpoint recovery, TCP Chandy–Lamport snapshots, and deterministic fault testing.
 
-On a matched 100-million-record local workload, stormglass reached **9.07M
-records/s with one worker** and **30.02M records/s with four workers**—4.62×
-and 4.55× Apache Flink 2.3.0—while both engines emitted the same 66,843,149
-window results and identical dual checksums.
+On a matched 100-million-record local workload, stormglass reached **27.50M
+records/s with eight workers**, **3.68× Apache Flink 2.3.0**, using the documented
+execution wall-time interval. All measured jobs agreed on 66,843,149 window
+results and both output digests. This is a single-host, checkpoint-disabled
+comparison with an in-memory digest sink; see [method and ranges](docs/benchmarks.md).
 
 ```text
  sources                         keyed execution
@@ -48,6 +49,21 @@ reach the same epoch. The implementation is deterministic and single-process,
 which makes the complete event trajectory replayable against a differential
 oracle.
 
+## TCP distributed snapshot mode
+
+A separate fixed-topology TCP path implements **Chandy–Lamport snapshots**:
+participants save local operator/source state, propagate FIFO markers, and
+record in-flight messages while processing continues. A global manifest commits
+only after all participant files and channel-sequence cuts validate. Recovery
+restores local state and replays channel records before fresh input.
+
+Tests use three separate TCP processes, capture nonempty in-flight state, and
+recover after a consumer is killed while a marker is missing. The protocol also
+passes an independent conservation check across 100 randomized FIFO schedules.
+This mode uses the same keyed window core, but is separate from native
+`SourceMerge` alignment and from the throughput benchmarks. See
+[chandy-lamport.md](docs/chandy-lamport.md) for the protocol, runbook and limits.
+
 ## Semantics
 
 - **Event time:** half-open tumbling and sliding windows with monotonic,
@@ -71,7 +87,8 @@ restore algorithm, and source/sink contract are in
 
 ## Correctness evidence
 
-The current suite contains **153 tests** and runs under ASan/UBSan plus
+The current CTest suite contains **177 tests** (175 GoogleTest cases and two
+TCP process scenarios) and runs under ASan/UBSan plus
 ThreadSanitizer on Linux and macOS in CI.
 
 - A naive differential oracle checks tumbling and sliding aggregation under
@@ -84,7 +101,7 @@ ThreadSanitizer on Linux and macOS in CI.
   checkpoints, during writes, with torn partition sets, and during barrier
   alignment; the recovery harness observed zero missing results.
 - The Flink comparator runs the same binary fixture through both engines and
-  rejects differences in record count, output count, late drops, or either
+  rejects incomplete jobs, incorrect actual/expected record counts, differing workloads, output counts, late drops, or either
   output digest.
 
 The crash harness establishes tested **at-least-once recovery**. It observed
@@ -94,23 +111,29 @@ scope and evidence: [verification.md](docs/verification.md).
 
 ## Measured results
 
-Matched local comparison on a 10-core Apple M1 Max with 32 GiB RAM, OpenJDK
-17.0.16, and Flink 2.3.0. Each cell is the median of three measured
-100-million-record jobs after warm-up. Checkpointing was disabled in both
-engines.
+Corrected-harness rerun on 2026-09-07: 10-core Apple M1 Max, 32 GiB RAM,
+OpenJDK 17.0.16, Flink 2.3.0. Each cell is the median of three measured
+100-million-record jobs. Checkpointing was disabled in both engines; Flink used
+a fresh JVM per job, a 1–4 GiB heap, and G1 GC. The separate warm-up process does
+not warm the measured JVM's JIT.
 
-| Parallelism | stormglass | Flink | stormglass / Flink |
+| Workers / keyed parallelism | stormglass M rec/s | Flink M rec/s | stormglass / Flink |
 |---:|---:|---:|---:|
-| 1 | **9.071M rec/s** | 1.964M rec/s | **4.62×** |
-| 2 | **14.029M rec/s** | 3.623M rec/s | **3.87×** |
-| 4 | **30.023M rec/s** | 6.593M rec/s | **4.55×** |
-| 8 | **28.227M rec/s** | 6.984M rec/s | **4.04×** |
+| 1 | **8.211** | 1.868 | **4.40×** |
+| 2 | **9.364** | 3.637 | **2.57×** |
+| 4 | **21.097** | 6.409 | **3.29×** |
+| 8 | **27.499** | 7.474 | **3.68×** |
 
-Every measured job emitted 66,843,149 results with zero late drops and matching
-checksums. This is a controlled single-host comparison of the keyed tumbling
-window path; it is not a distributed networking, durable-sink, or checkpoint
-comparison. Workloads, ranges, native microbenchmarks, and limitations are in
-[benchmarks.md](docs/benchmarks.md).
+Every measured job consumed the expected 100M records and emitted 66,843,149
+results with zero late drops and matching dual digests. Digest agreement is
+strong probabilistic evidence, not a proof of identical output. Timing includes
+native fixture load/setup and Flink local job startup; this is not a comparison
+of distributed networking, durable sinks, checkpoints, or operator-only speed.
+
+The earlier 30.023M rec/s / 4.55× Flink and 3.31× scaling figures describe the
+previous harness and run. Use the [current approved claims](docs/approved-claims.md)
+for resume text. Full ranges, timing changes, historical measurements and
+limitations are in [benchmarks.md](docs/benchmarks.md).
 
 ## Quickstart
 
@@ -149,6 +172,7 @@ The matched Flink runbook is in [`bench/flink`](bench/flink/README.md).
 |---|---|
 | [architecture.md](docs/architecture.md) | Source merge, routing, worker ownership, window state, and backpressure |
 | [event-time-semantics.md](docs/event-time-semantics.md) | Watermarks, idleness, allowed lateness, re-firing, and window lifecycle |
+| [chandy-lamport.md](docs/chandy-lamport.md) | TCP markers, in-flight state, global commit and process recovery |
 | [recovery.md](docs/recovery.md) | Barrier alignment, checkpoint format, restore selection, and delivery contract |
 | [verification.md](docs/verification.md) | Differential oracles, cross-N invariance, sanitizers, and crash nemeses |
 | [benchmarks.md](docs/benchmarks.md) | Current results, methodology, Flink comparison, and interpretation |
@@ -161,11 +185,12 @@ The matched Flink runbook is in [`bench/flink`](bench/flink/README.md).
 stormglass is a portfolio and research engine hardened through deterministic
 testing and measurement. Its current boundaries are explicit:
 
-- Execution is single-process. `SourceMerge` models K inputs through
+- The native router/worker path is single-process. `SourceMerge` models K inputs through
   deterministic round-robin pulls rather than concurrent broker or socket
   consumers.
-- Included sources are deterministic generators and fixtures. There is no Kafka,
-  CDC, or network transport integration.
+- The TCP snapshot path supports fixed, configured peer connections and replayable
+  application sources; its process tests use generated input. There is no Kafka,
+  CDC, dynamic membership or authenticated network deployment integration.
 - Checkpoints protect operator state. There is no transactional sink, input
   event-ID deduplication, or general end-to-end exactly-once guarantee.
 - Checkpoint history for partitioned jobs is retained without coordinated

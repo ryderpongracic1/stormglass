@@ -63,6 +63,9 @@ public:
     // consuming (mirrors Pipeline::TryRestore: panes + fired windows + watermark).
     void Restore(const CheckpointData& data);
 
+    // Copy a local cut for the network snapshot protocol; owner-thread only.
+    [[nodiscard]] CheckpointData Capture(uint64_t offset) const;
+
     [[nodiscard]] const Stats& stats() const { return stats_; }
     [[nodiscard]] Timestamp watermark() const { return watermark_.Current(); }
 

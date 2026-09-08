@@ -149,4 +149,16 @@ void KeyedProcessor::Restore(const CheckpointData& data) {
     watermark_.Advance(data.watermark);
 }
 
+CheckpointData KeyedProcessor::Capture(uint64_t offset) const {
+    CheckpointData data;
+    data.offset = offset;
+    data.watermark = watermark_.Current();
+    state_.ForEachPane([&](const std::string& key, const Window& window, const Pane& pane) {
+        data.panes.push_back({key, window, pane.sum, pane.count});
+    });
+    for (const auto& window : state_.FiredWindows()) data.fired_windows.push_back(window);
+    data.refired_windows = state_.RefiredWindows();
+    return data;
+}
+
 } // namespace stormglass
