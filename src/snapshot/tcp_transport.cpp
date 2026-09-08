@@ -37,10 +37,10 @@ Bytes Encode(const Message &m) {
 Message Decode(const Bytes &frame) {
     if (frame.size() < 4)
         throw std::runtime_error("short TCP frame");
-    Decoder trailer(std::span(frame).last(4));
+    Decoder trailer{std::span<const uint8_t>{frame}.last(4)};
     if (Crc32c(frame.data(), frame.size() - 4) != trailer.U32())
         throw std::runtime_error("TCP frame CRC mismatch");
-    Decoder d(std::span(frame).first(frame.size() - 4));
+    Decoder d{std::span<const uint8_t>{frame}.first(frame.size() - 4)};
     if (d.U32() != 0x53474331)
         throw std::runtime_error("TCP protocol version mismatch");
     Message m;
@@ -197,7 +197,7 @@ void TcpTransport::PollOnce(const std::function<void(NodeId, const Message &)> &
                             "TCP peer disconnected; snapshot epoch cannot exclude it");
                     c.input.insert(c.input.end(), buffer.begin(), buffer.begin() + n);
                     while (c.input.size() >= 4) {
-                        Decoder length(std::span(c.input).first(4));
+                        Decoder length{std::span<const uint8_t>{c.input}.first(4)};
                         auto size = length.U32();
                         if (size < 29 || size > kMaxFrame)
                             throw std::runtime_error("invalid TCP frame length");

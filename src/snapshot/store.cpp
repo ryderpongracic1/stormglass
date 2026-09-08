@@ -25,10 +25,10 @@ void Seal(Encoder &e) {
 Decoder Open(const Bytes &bytes) {
     if (bytes.size() < 4 || bytes.size() > kLimit)
         throw std::runtime_error("invalid snapshot file size");
-    Decoder tail(std::span(bytes).last(4));
+    Decoder tail{std::span<const uint8_t>{bytes}.last(4)};
     if (Crc32c(bytes.data(), bytes.size() - 4) != tail.U32())
         throw std::runtime_error("snapshot file CRC mismatch");
-    return Decoder(std::span(bytes).first(bytes.size() - 4));
+    return Decoder(std::span<const uint8_t>{bytes}.first(bytes.size() - 4));
 }
 std::filesystem::path Epoch(const std::string &root, uint64_t epoch) {
     if (!epoch)
