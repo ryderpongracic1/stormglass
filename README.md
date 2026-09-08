@@ -131,9 +131,8 @@ native fixture load/setup and Flink local job startup; this is not a comparison
 of distributed networking, durable sinks, checkpoints, or operator-only speed.
 
 The earlier 30.023M rec/s / 4.55× Flink and 3.31× scaling figures describe the
-previous harness and run. Use the [current approved claims](docs/approved-claims.md)
-for resume text. Full ranges, timing changes, historical measurements and
-limitations are in [benchmarks.md](docs/benchmarks.md).
+previous harness and run and are superseded. Full ranges, timing changes,
+historical measurements and limitations are in [benchmarks.md](docs/benchmarks.md).
 
 ## Quickstart
 
@@ -182,8 +181,8 @@ The matched Flink runbook is in [`bench/flink`](bench/flink/README.md).
 
 ## Scope and limitations
 
-stormglass is a portfolio and research engine hardened through deterministic
-testing and measurement. Its current boundaries are explicit:
+stormglass is a research engine hardened through deterministic testing and
+measurement. Its current boundaries are explicit:
 
 - The native router/worker path is single-process. `SourceMerge` models K inputs through
   deterministic round-robin pulls rather than concurrent broker or socket

@@ -1,6 +1,6 @@
 # Stormglass hardening audit — 2026-09-06
 
-> Historical audit from 2026-09-06. For current resume wording and the corrected comparison methodology, see [approved claims](approved-claims.md) and [benchmarks](benchmarks.md). The approved text below describes that earlier workload, not the latest benchmark.
+> Historical audit from 2026-09-06. For the corrected comparison methodology, see [benchmarks](benchmarks.md). The findings below describe that earlier workload, not the latest benchmark.
 
 This is the dated record of the hardening review. See the project
 [README](../README.md) and the focused documents in this directory for the
@@ -57,7 +57,7 @@ These boundaries make a transactional, broker-integrated, end-to-end exactly-onc
 * **TSan:** the local arm64 audit run covered all 153 distinct tests without a race report. Subsequent CI runs execute the complete suite under TSan on Linux x86-64 and macOS arm64.
 * **26 fresh confirmed SIGKILL scenarios passed:** 7 between checkpoints, 7 during checkpoint writes, 7 with torn partition sets, and 5 mid-alignment. Zero missing results across all scenarios. The harness observed **771 replay duplicates** (91 + 350 + 330 + 0). Retries used to land a particular failure point are recorded in the logs; 26 is the number of successful scenario runs, not a claim that exactly 26 child processes were launched.
 * All five mid-alignment scenarios had zero duplicates and **zero pre-crash emits**. This supports recovery from partial alignment, not exactly-once behavior across an already-visible output boundary.
-* Historical 44–56% hand-off overhead reduction appears in the upstream README and commit message; this audit did not reproduce that before/after experiment. It is omitted from the approved claims.
+* Historical 44–56% hand-off overhead reduction appears in the upstream README and commit message; this audit did not reproduce that before/after experiment. It is not carried forward as a current result.
 
 Benchmark and differential results follow after final validation. The accompanying evidence bundle contains exact command output.
 

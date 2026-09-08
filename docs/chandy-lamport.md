@@ -125,14 +125,19 @@ contract remains separate: output already made visible after a checkpoint can
 be replayed after rollback. The original 26 crash-harness scenarios and their
 at-least-once qualification remain distinct evidence.
 
-## Local validation
+## Suite and platform status
 
 The 177-test CTest suite (175 GoogleTest cases plus two process scenarios)
-passed ASan/UBSan and ThreadSanitizer on macOS arm64. This includes all 24
-focused snapshot tests. New network behavior is covered by the existing Linux
-and macOS CI jobs as well; their results should be read at the pushed revision.
-The previous x86-64 sanitizer result predates this feature and is not substituted
-for validation of the new code.
+passed ASan/UBSan and ThreadSanitizer on macOS arm64, including all 24 focused
+snapshot tests. CI at `6e3d5d4` ran the suite on Linux x86-64 under ASan/UBSan
+and ThreadSanitizer, and on macOS arm64 under ThreadSanitizer. Both
+architectures pass, so this code is no longer validated on Clang alone.
+
+The in-flight channel log is load-bearing rather than bookkeeping. Suppressing
+replay delivery in `Participant::Restore` while leaving sequence accounting
+intact makes the three-process demo fail and exit nonzero: recovery correctness
+depends on replaying the recorded channel messages, not only on restoring
+operator state.
 
 ## Run it
 
