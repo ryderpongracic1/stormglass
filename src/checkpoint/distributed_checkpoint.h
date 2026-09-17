@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace stormglass {
 
@@ -42,5 +45,41 @@ std::optional<uint64_t> HighestCompleteCheckpoint(const std::string& root,
 // real-kill nemesis captures and the restore path must discard.
 std::optional<uint64_t> HighestPartialCheckpoint(const std::string& root,
                                                   uint32_t num_partitions);
+
+// Live completion tracking and coordinated retention for one running job.
+//
+// Partitions report each checkpoint after it is durably written. Every
+// partition receives the same broadcast barriers in the same order, so once
+// every partition has reported an offset >= O, all of them have written O: the
+// minimum of the per-partition latest offsets is the newest complete global
+// checkpoint, with no directory scan or CRC read.
+//
+// Retention is decided only here, never per partition: with `retain` > 0, the
+// newest `retain` complete checkpoints are kept and every partition file with
+// a lower offset is deleted. Files above the oldest retained complete offset,
+// including a torn newer partial set, are never touched, so the last complete
+// common cut always survives. Deleting is best effort; a leftover file only
+// costs space. Thread-safe.
+class PartitionedCheckpointTracker {
+public:
+    // `restored` is the complete checkpoint the job restored from, if any; it
+    // counts as the first retained complete checkpoint. retain == 0 keeps all.
+    PartitionedCheckpointTracker(std::string root, uint32_t num_partitions, uint32_t retain,
+                                 std::optional<uint64_t> restored);
+
+    void OnPartitionCheckpoint(uint32_t partition, uint64_t offset);
+
+    [[nodiscard]] std::optional<uint64_t> LastComplete() const;
+
+private:
+    void PruneBelowLocked(uint64_t cutoff);
+
+    const std::string root_;
+    const uint32_t num_partitions_;
+    const uint32_t retain_;
+    mutable std::mutex mu_;
+    std::vector<std::optional<uint64_t>> latest_;
+    std::deque<uint64_t> complete_;  // ascending, newest at back
+};
 
 } // namespace stormglass

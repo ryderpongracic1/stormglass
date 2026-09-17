@@ -31,6 +31,18 @@ class ComparisonValidationTest(unittest.TestCase):
     def test_valid_pair(self):
         self.assertIn('Validated 2 jobs', summarize(self.root))
 
+    def test_correctness_only_omits_rates(self):
+        text = summarize(self.root, correctness_only=True)
+        self.assertIn('Validated 2 jobs', text)
+        self.assertIn('Throughput omitted', text)
+        self.assertNotIn('stormglass/flink', text)
+        self.assertNotRegex(text, r'\d+\.\d+x')
+
+    def test_correctness_only_still_rejects_mismatch(self):
+        self.write('flink', outputs='101')
+        with self.assertRaisesRegex(ValueError, 'differ'):
+            summarize(self.root, correctness_only=True)
+
     def test_missing_in_both_is_rejected(self):
         for engine in ('stormglass', 'flink'):
             self.write(engine, outputs=None)

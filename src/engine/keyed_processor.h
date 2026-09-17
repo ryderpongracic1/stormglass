@@ -8,6 +8,7 @@
 #include "checkpoint/reader.h"  // CheckpointData (restore)
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -56,6 +57,12 @@ public:
     // snapshots this worker's state to its partition directory (if configured).
     void ProcessControl(const ControlRecord& control);
 
+    // Called with the offset after each checkpoint is durably written, on the
+    // thread that processed the barrier.
+    void SetCheckpointListener(std::function<void(uint64_t)> listener) {
+        checkpoint_listener_ = std::move(listener);
+    }
+
     // Fire every remaining window (mirrors Pipeline::Run's final-flush block).
     void FinalFlush();
 
@@ -75,6 +82,7 @@ private:
     Duration allowed_lateness_;
     bool use_lateness_;
     std::string checkpoint_dir_;
+    std::function<void(uint64_t)> checkpoint_listener_;
     WatermarkTracker watermark_;
     KeyedWindowState state_;
     Stats stats_{};

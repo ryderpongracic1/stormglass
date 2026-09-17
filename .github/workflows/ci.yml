@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DSTORMGLASS_BENCH=ON
       - name: Build
         run: cmake --build build-release -j$(nproc)
       - name: Bench
@@ -77,7 +77,7 @@ jobs:
             io.stormglass.bench.FlinkComparison \
             --fixture /tmp/comparison.sgfx --cycles 2 --parallelism 2 \
             > /tmp/comparison-results/flink-n2-run1.txt
-          python3 bench/flink/summarize_results.py /tmp/comparison-results
+          python3 bench/flink/summarize_results.py --correctness-only /tmp/comparison-results
       - name: Verify heavy-disorder late drops
         run: |
           python3 bench/fixture/generate_fixture.py \
@@ -92,4 +92,4 @@ jobs:
             io.stormglass.bench.FlinkComparison \
             --fixture /tmp/heavy.sgfx --cycles 2 --parallelism 2 \
             > /tmp/heavy-results/flink-n2-run1.txt
-          python3 bench/flink/summarize_results.py /tmp/heavy-results
+          python3 bench/flink/summarize_results.py --correctness-only /tmp/heavy-results

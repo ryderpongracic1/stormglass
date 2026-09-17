@@ -18,6 +18,8 @@ public:
     [[nodiscard]] uint64_t CurrentOffset() const override;
     // Stopping early truncates the stream but does not change its identity.
     [[nodiscard]] std::string Descriptor() const override { return inner_->Descriptor(); }
+    [[nodiscard]] bool Replayable() const override { return inner_->Replayable(); }
+    void Cancel() override { inner_->Cancel(); }
 
 private:
     std::unique_ptr<Source> inner_;

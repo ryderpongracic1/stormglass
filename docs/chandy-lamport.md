@@ -127,9 +127,9 @@ at-least-once qualification remain distinct evidence.
 
 ## Suite and platform status
 
-The 177-test CTest suite (175 GoogleTest cases plus two process scenarios)
-passed ASan/UBSan and ThreadSanitizer on macOS arm64, including all 24 focused
-snapshot tests. CI at `6e3d5d4` ran the suite on Linux x86-64 under ASan/UBSan
+When this mode landed, the then 177-test CTest suite (175 GoogleTest cases plus
+two process scenarios) passed ASan/UBSan and ThreadSanitizer on macOS arm64,
+including all 24 focused snapshot tests. CI at `6e3d5d4` ran the suite on Linux x86-64 under ASan/UBSan
 and ThreadSanitizer, and on macOS arm64 under ThreadSanitizer. Both
 architectures pass, so this code is no longer validated on Clang alone.
 

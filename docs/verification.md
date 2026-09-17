@@ -1,7 +1,7 @@
 # Verification
 
 stormglass uses deterministic generation, an independent aggregation oracle,
-direct protocol tests, fault injection, and sanitizers. The CTest suite contains 177 tests: 175
+direct protocol tests, fault injection, and sanitizers. The CTest suite contains 203 tests: 201
 GoogleTest cases and two separate-process TCP scenarios. Benchmark tooling has separate Python and executable regression checks; these are not included in that count.
 
 ## Differential oracle
@@ -86,6 +86,25 @@ Recovery tests include:
 
 The findings that motivated these tests are recorded in
 [hardening-audit.md](hardening-audit.md).
+
+## Job lifecycle and live inputs
+
+`job_lifecycle_test.cpp` covers the operational paths:
+
+- suspend while the source is blocked in `Next()`: `Cancel()` wakes it, only
+  closed windows are emitted, every partition checkpoints the same offset, and
+  restart plus the suspended run equal an uninterrupted run;
+- suspend on a busy four-worker job at an arbitrary point, with the same
+  equality and no value emitted that the uninterrupted run never produced;
+- final stop, stop requested before `Run()`, and the single-threaded pipeline;
+- `Progress()` observed mid-run and after completion;
+- live `SourceMerge`: a quiet channel does not block the merge, wall-clock
+  idleness releases the watermark, the merge refuses to seek or checkpoint, and
+  a replayable merge rejects empty batches;
+- pipeline backoff on empty batches (a 100 ms quiet period costs fewer than
+  5,000 polls);
+- coordinated retention keeping exactly the newest complete checkpoints, and
+  the tracker never deleting a retained cut or a newer partial set.
 
 ## Sanitizers and CI
 

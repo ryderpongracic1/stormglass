@@ -11,6 +11,10 @@ SourceMerge::SourceMerge(SourceMergeConfig config)
     : config_(std::move(config)),
       combiner_(std::max<std::size_t>(1, config_.sources.size())) {
     if (config_.merged_batch_size == 0) throw std::invalid_argument("merged batch size must be positive");
+    if (config_.live_inputs)
+        throw std::invalid_argument("generator-config SourceMerge inputs are replayable; use SourceMergeInput for live inputs");
+    if (config_.idle_timeout_wall.count() != 0)
+        throw std::invalid_argument("idle_timeout_wall requires live_inputs");
     for (const auto& src : config_.sources) {
         // v3 Phase 3: wrapped sources emit their OWN barriers now (Phase 1/2 forced
         // this to 0). EffectiveInterval picks the source's own checkpoint_interval,
@@ -33,6 +37,10 @@ SourceMerge::SourceMerge(std::vector<SourceMergeInput> inputs, SourceMergeConfig
         throw std::invalid_argument("SourceMerge inputs and generator configs cannot be mixed");
     if (config_.checkpoint_interval != 0)
         throw std::invalid_argument("SourceMerge inputs emit their own barriers; checkpoint_interval must be 0");
+    if (config_.idle_timeout_wall.count() < 0)
+        throw std::invalid_argument("idle_timeout_wall must be nonnegative");
+    if (config_.idle_timeout_wall.count() > 0 && !config_.live_inputs)
+        throw std::invalid_argument("idle_timeout_wall requires live_inputs");
     for (auto& input : inputs) {
         if (!input.source) throw std::invalid_argument("SourceMerge input source is null");
         AddInput(std::move(input.source), std::move(input.idle_spans));
@@ -62,6 +70,7 @@ void SourceMerge::ResetProgress() {
         st.consecutive_empty = 0;
         st.idle = false;
         st.barriers_seen = 0;
+        st.last_item = std::chrono::steady_clock::now();
     }
     combiner_ = MinWatermarkCombiner(std::max<std::size_t>(1, states_.size()));
     rr_ = 0;
@@ -83,22 +92,48 @@ std::string SourceMerge::Descriptor() const {
     return out + ")";
 }
 
-bool SourceMerge::PullNextItem(std::size_t i, BatchItem& out) {
+SourceMerge::PullResult SourceMerge::PullNextItem(std::size_t i, BatchItem& out) {
     SourceState& st = states_[i];
-    // Refill until we have an item or the wrapped source is exhausted. Batches
-    // from DeterministicGenerator are non-empty until exhaustion, so this loops
-    // at most once in practice; the guard keeps it robust.
-    while (st.cursor >= st.buf.items.size()) {
+    if (st.cursor >= st.buf.items.size()) {
         auto batch = st.source->Next();
         if (!batch.has_value()) {
             st.exhausted = true;
-            return false;
+            return PullResult::kExhausted;
+        }
+        if (batch->items.empty()) {
+            // "No data yet". Only a live merge may see this: in a replayable
+            // merge it would make the interleaving depend on timing.
+            if (!config_.live_inputs) {
+                throw std::logic_error(
+                    "SourceMerge input returned an empty batch; set live_inputs for live sources");
+            }
+            return PullResult::kNoData;
         }
         st.buf = std::move(*batch);
         st.cursor = 0;
     }
     out = st.buf.items[st.cursor++];
-    return true;
+    // Clock reads cost more than the pull itself; take one only when wall-clock
+    // idleness needs it.
+    if (config_.idle_timeout_wall.count() > 0) st.last_item = std::chrono::steady_clock::now();
+    return PullResult::kItem;
+}
+
+void SourceMerge::MarkChannelIdle(std::size_t i, Batch& out) {
+    states_[i].idle = true;
+    if (auto merged = combiner_.MarkIdle(i)) {
+        out.items.emplace_back(ControlRecord{
+            .type = ControlType::kWatermark,
+            .watermark = *merged,
+            .checkpoint_offset = merged_offset_,
+        });
+    }
+    // Excluding the quiet channel from the MIN ALSO excludes it from the barrier
+    // ALIGNMENT set. If every remaining active channel already delivered its
+    // barrier for the open epoch, the epoch can now close WITHOUT this channel —
+    // this is precisely what stops a quiet channel from deadlocking alignment
+    // (see MaybeCloseEpoch).
+    MaybeCloseEpoch(out);
 }
 
 SourceMerge::StepResult SourceMerge::ProduceOneMergedStep(Batch& out,
@@ -142,26 +177,25 @@ SourceMerge::StepResult SourceMerge::ProduceOneMergedStep(Batch& out,
                 // so event-time can progress. With it excluded, the MIN over the
                 // ACTIVE sources may advance — emit that merged watermark instead
                 // of letting the quiet source stall firing forever.
-                st.idle = true;
-                if (auto merged = combiner_.MarkIdle(i)) {
-                    out.items.emplace_back(ControlRecord{
-                        .type = ControlType::kWatermark,
-                        .watermark = *merged,
-                        .checkpoint_offset = merged_offset_,
-                    });
-                }
-                // Excluding the quiet channel from the MIN ALSO excludes it from the
-                // barrier ALIGNMENT set. If every remaining active channel already
-                // delivered its barrier for the open epoch, the epoch can now close
-                // WITHOUT this channel — this is precisely what stops a quiet channel
-                // from deadlocking alignment (see MaybeCloseEpoch).
-                MaybeCloseEpoch(out);
+                MarkChannelIdle(i, out);
             }
             return StepResult::kProduced;  // serviced a turn; stream still live
         }
 
         BatchItem item;
-        if (!PullNextItem(i, item)) {
+        const PullResult pulled = PullNextItem(i, item);
+        if (pulled == PullResult::kNoData) {
+            // A live channel with nothing to deliver yields its turn. Wall-clock
+            // idleness is the only idleness that applies to it: a count of empty
+            // polls would measure the caller's poll rate, not the channel.
+            rr_ = (i + 1) % k;
+            if (config_.idle_timeout_wall.count() > 0 && !st.idle &&
+                std::chrono::steady_clock::now() - st.last_item >= config_.idle_timeout_wall) {
+                MarkChannelIdle(i, out);
+            }
+            return StepResult::kNoData;
+        }
+        if (pulled == PullResult::kExhausted) {
             // This source just exhausted. Remove it from the alignment set: the
             // remaining active channels may now be able to close the open epoch
             // (a dead channel can never deliver another barrier).
@@ -272,16 +306,36 @@ std::optional<Batch> SourceMerge::Next() {
 
     Batch out;
     std::size_t data_in_batch = 0;
+    std::size_t quiet_steps = 0;
     while (data_in_batch < config_.merged_batch_size) {
-        if (ProduceOneMergedStep(out, data_in_batch) == StepResult::kExhausted) {
+        const StepResult step = ProduceOneMergedStep(out, data_in_batch);
+        if (step == StepResult::kExhausted) {
             break;  // no live source produced — stream is draining
+        }
+        if (step == StepResult::kNoData) {
+            // Every channel had its turn without data: hand back what we have
+            // (possibly nothing) instead of polling quiet live inputs in a loop.
+            if (++quiet_steps >= states_.size()) break;
+        } else {
+            quiet_steps = 0;
         }
     }
 
     if (out.items.empty()) {
-        return std::nullopt;
+        if (AllExhausted() || !config_.live_inputs) return std::nullopt;
+        return Batch{};  // live and quiet: "no data yet"
     }
     return out;
+}
+
+bool SourceMerge::Replayable() const {
+    if (config_.live_inputs) return false;
+    return std::all_of(states_.begin(), states_.end(),
+                       [](const SourceState& s) { return s.source->Replayable(); });
+}
+
+void SourceMerge::Cancel() {
+    for (SourceState& st : states_) st.source->Cancel();
 }
 
 void SourceMerge::Seek(uint64_t offset) {
@@ -292,6 +346,9 @@ void SourceMerge::Seek(uint64_t offset) {
     // non-seeked run holds at the same offset — and thus the identical merged
     // sequence afterward. The merged offset does not determine per-channel
     // offsets, so every channel must replay from its own start.
+    if (config_.live_inputs && offset > 0) {
+        throw std::logic_error("SourceMerge with live_inputs cannot seek: its merge order is not replayable");
+    }
     for (SourceState& st : states_) st.source->Seek(0);
     ResetProgress();
 

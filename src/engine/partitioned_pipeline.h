@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/job_control.h"
 #include "engine/keyed_processor.h"
 #include "sink/sink.h"
 #include "source/source.h"
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace stormglass {
@@ -36,6 +38,11 @@ struct PartitionedPipelineConfig {
     // count, lateness, assigner and source descriptors; Run() throws
     // JobManifestMismatch rather than restoring under a different configuration.
     std::string checkpoint_dir;
+
+    // Complete global checkpoints to keep. After each checkpoint completes on
+    // every partition, partition files older than the oldest retained complete
+    // checkpoint are deleted. 0 (default) keeps all history.
+    uint32_t checkpoint_retention = 0;
 
     // Optional per-worker sink factory. When set, worker k emits directly to
     // worker_sink_factory(k) instead of forwarding into the constructor's sink.
@@ -76,10 +83,13 @@ public:
                         std::function<std::unique_ptr<WindowAssigner>()> assigner_factory,
                         std::unique_ptr<Sink> sink,
                         PartitionedPipelineConfig config);
+    ~PartitionedPipeline();
 
     struct Stats {
-        // Partitioned quantities — summed across workers (disjoint keys), so
-        // these equal the single-threaded totals.
+        // Partitioned quantities — summed across workers (disjoint keys).
+        // Record counts equal the single-threaded totals. Window counts do not:
+        // a window whose keys span k workers counts k firings here, once in the
+        // single-threaded engine.
         uint64_t records_processed = 0;
         uint64_t windows_fired = 0;
         uint64_t windows_refired = 0;
@@ -109,15 +119,37 @@ public:
         //     toy-source limitation); a real log source seeks in ~O(1).
         uint64_t restore_state_micros = 0;
         uint64_t restore_seek_micros = 0;
+
+        // Set when Run() returned because of RequestStop(StopMode::kSuspend).
+        bool suspended = false;
+        // Offset of the global checkpoint taken on suspend (checkpointing only).
+        std::optional<uint64_t> suspend_checkpoint_offset;
     };
 
+    // Runs until the source ends or a stop is requested. Throws
+    // std::invalid_argument if checkpointing is enabled on a source whose
+    // Replayable() is false. A source's empty batch means "no data yet": the
+    // router backs off and polls again.
     Stats Run();
+
+    // Thread-safe. Ask a running (or not yet started) Run() to stop after the
+    // source batch being routed, waking a blocked source via Source::Cancel().
+    // kSuspend broadcasts a final checkpoint barrier at the source's current
+    // offset (when checkpointing) and stops workers without firing open windows;
+    // kFinal ends input and fires them. The first request's mode wins.
+    void RequestStop(StopMode mode = StopMode::kSuspend);
+
+    // Thread-safe counters, published by each worker after every batch.
+    [[nodiscard]] JobProgress Progress() const;
 
 private:
     std::unique_ptr<Source> source_;
     std::function<std::unique_ptr<WindowAssigner>()> assigner_factory_;
     std::unique_ptr<Sink> sink_;
     PartitionedPipelineConfig config_;
+
+    struct Control;
+    std::unique_ptr<Control> control_;
 };
 
 } // namespace stormglass

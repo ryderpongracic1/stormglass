@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ryderpongracic1/stormglass/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderpongracic1/stormglass/actions/workflows/ci.yml)
 
-Built a C++20 event-time stream processor with keyed shared-nothing workers,
+A C++20 event-time stream processor with keyed shared-nothing workers,
 tumbling and sliding windows, multi-source watermark coordination, aligned
 checkpoint recovery, TCP Chandy–Lamport snapshots, and deterministic fault testing.
 
@@ -37,8 +37,9 @@ rates, consistent state cuts, and recovery after a process dies during a
 checkpoint.
 
 Records are hash-partitioned by key across workers. Each worker owns its keys,
-window state, watermark tracker, and sink, so aggregation needs no shared
-mutable state. The router transfers one batch per worker queue instead of
+window state, and watermark tracker, so aggregation needs no shared mutable
+state. Workers hand results to the job's sink under one lock after each input
+batch and before each checkpoint. The router transfers one batch per worker queue instead of
 locking and notifying for every record. Watermarks and barriers travel in-band
 with data and are broadcast to every partition in FIFO order.
 
@@ -87,7 +88,7 @@ restore algorithm, and source/sink contract are in
 
 ## Correctness evidence
 
-The current CTest suite contains **177 tests** (175 GoogleTest cases and two
+The current CTest suite contains **203 tests** (201 GoogleTest cases and two
 TCP process scenarios) and runs under ASan/UBSan plus
 ThreadSanitizer on Linux and macOS in CI.
 
@@ -97,6 +98,11 @@ ThreadSanitizer on Linux and macOS in CI.
   requires every parallel result set and late-drop count to match the oracle.
 - Direct fan-in tests cover minimum watermark combination, idle-source resume,
   exact aligned cuts, blocked early channels, and the K=1 reduction.
+- Lifecycle tests stop jobs mid-stream and while a source is blocked. They
+  check that suspend emits no open window and that suspend plus restart
+  matches an uninterrupted run. They also cover live-input backoff and
+  wall-clock idleness, progress counters, and retention that never deletes the
+  newest complete checkpoint.
 - Twenty-six confirmed fork-and-SIGKILL scenarios cover crashes between
   checkpoints, during writes, with torn partition sets, and during barrier
   alignment; the recovery harness observed zero missing results.
@@ -184,18 +190,27 @@ The matched Flink runbook is in [`bench/flink`](bench/flink/README.md).
 stormglass is a research engine hardened through deterministic testing and
 measurement. Its current boundaries are explicit:
 
-- The native router/worker path is single-process. `SourceMerge` combines K
-  replayable `Source` inputs through deterministic round-robin pulls rather than
-  concurrent broker or socket consumers. Restore replays every input from its
-  start because no per-input offset vector is persisted.
+- The native router/worker path is single-process, and the only built-in inputs
+  are the synthetic generator and the benchmark fixture reader. There are no
+  file, socket or broker connectors. `SourceMerge` combines K `Source` inputs
+  through round-robin pulls on one thread. Replayable merges restore by
+  replaying every input from its start, because no per-input offset vector is
+  persisted. Live merges (quiet inputs, wall-clock idleness) cannot be
+  checkpointed.
+- The data model is fixed: string keys, `int64` values, and a sum plus count per
+  key and window. There are no other aggregate functions, value types, or
+  operators such as map, filter or join.
 - The TCP snapshot path supports fixed, configured peer connections and replayable
   application sources; its process tests use generated input. There is no Kafka,
   CDC, dynamic membership or authenticated network deployment integration.
 - Checkpoints protect operator state, and output reaches the sink before each
   checkpoint, so recovery is at-least-once. There is no transactional sink,
   input event-ID deduplication, or general end-to-end exactly-once guarantee.
-- Checkpoint history for partitioned jobs is retained without coordinated
-  pruning, so disk use and recovery scans grow over time.
+- Partitioned jobs keep all checkpoint history unless `checkpoint_retention` is
+  set. Checkpoints are triggered only by source barriers, never by time.
+- Jobs are embedded C++ objects: there is no job CLI, configuration file,
+  logging, or metrics export. `RequestStop` and `Progress` are the control and
+  observation hooks; exporting them is the host application's job.
 - Restore requires stable worker count, window configuration, source ordering,
   lateness, and barrier cadence. A persisted job manifest rejects changes to
   them; custom assigners and sources must implement `Descriptor()` to take part.

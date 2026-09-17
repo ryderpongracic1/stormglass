@@ -66,6 +66,10 @@ configuration, lateness, and barrier cadence must remain stable across restart.
 The job manifest below enforces this. There is no source-offset vector for a
 broker and no rescaling protocol.
 
+Checkpointed jobs refuse a source whose `Replayable()` is false. A live
+`SourceMerge` reports false, because its interleaving depends on arrival timing;
+a durable live merge would need per-input offsets in the checkpoint.
+
 The deterministic generator implements seek by replaying from its seed, which
 is O(offset). `SourceMerge` accepts arbitrary replayable `Source` channels, but
 its seek rewinds each channel to 0 and replays the merge, so it is O(offset)
@@ -124,11 +128,29 @@ reports duplicates. End-to-end exactly-once delivery would still require a
 replayable external source plus a transactional sink tied to checkpoint
 progress.
 
+## Suspend
+
+`RequestStop(StopMode::kSuspend)` stops a job for a restart or upgrade without
+publishing partial windows. After the batch being routed, the router broadcasts
+a checkpoint barrier stamped with the source's current offset, so every
+partition snapshots the same cut, including open panes and pending re-fires.
+Workers then flush output and exit without a final flush. `Stats` reports
+`suspended` and `suspend_checkpoint_offset`. A restart restores that checkpoint,
+seeks the source there, and emits each open window once with its full value.
+Without checkpointing, suspend discards open window state.
+
 ## Retention and ownership
 
-Partitioned jobs currently retain all checkpoint history so independent worker
-pruning cannot delete the last complete common cut. Disk consumption and scan
-time therefore grow with history. Coordinated pruning is future work.
+Workers never prune independently, because that could delete the last complete
+common cut. `PartitionedPipelineConfig::checkpoint_retention` enables
+coordinated pruning. Workers report each durable checkpoint to one tracker.
+Every partition receives the same barriers in order, so the minimum of the
+partitions' latest offsets is the newest complete checkpoint, with no directory
+scan. The tracker keeps the newest `checkpoint_retention` complete checkpoints
+and deletes partition files below the oldest one it keeps. Newer partial sets
+are never touched. The default of 0 retains all history, so disk use and
+recovery scans grow over time. The single-threaded `Pipeline` keeps its latest
+two checkpoints.
 
 A checkpoint directory is assumed to belong to one job. The job manifest rejects
 a restart under a different configuration, but there is no multi-process writer

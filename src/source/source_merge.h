@@ -4,6 +4,7 @@
 #include "source/source.h"
 #include "stream/batch.h"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -95,13 +96,16 @@ private:
     Timestamp emitted_{Timestamp::min()};
 };
 
-/// One input channel for SourceMerge's general constructor: any replayable
-/// Source plus the idle spans SourceMerge should model on it.
+/// One input channel for SourceMerge's general constructor: any Source plus the
+/// idle spans SourceMerge should model on it.
 ///
-/// The source owns its own watermarks and barriers. It must be deterministic
-/// from the start (Seek(0) followed by Next() replays the identical trajectory),
-/// because SourceMerge::Seek replays every channel from offset 0 to rebuild the
-/// merged interleaving and alignment state.
+/// The source owns its own watermarks and barriers. For a replayable merge
+/// (live_inputs false) it must be deterministic from the start (Seek(0)
+/// followed by Next() replays the identical trajectory), because
+/// SourceMerge::Seek replays every channel from offset 0 to rebuild the merged
+/// interleaving and alignment state. A live channel (live_inputs true) may
+/// return empty batches while it has no data, but must not block in Next():
+/// SourceMerge pulls every channel from one thread.
 struct SourceMergeInput {
     std::unique_ptr<Source> source;
     std::vector<IdleSpan> idle_spans;  // sorted by start_offset, non-overlapping
@@ -136,6 +140,23 @@ struct SourceMergeConfig {
     // Data records assembled per merged Next() batch. Matches the generator's
     // batch_size convention so CurrentOffset() lands on clean batch boundaries.
     uint32_t merged_batch_size = 1024;
+
+    // Live inputs. false (default): every channel is replayable and an empty
+    // batch from one is a contract violation (std::logic_error), which keeps the
+    // merged trajectory deterministic and checkpointable. true: channels may
+    // return empty batches while quiet; SourceMerge skips them, returns an empty
+    // batch itself when no channel has data, and applies idle_timeout_wall. The
+    // merge order then depends on arrival timing, so the merge is NOT
+    // replayable: Replayable() is false, checkpointed jobs refuse it, and
+    // Seek(offset > 0) throws. Durable live merges need per-input offsets in the
+    // checkpoint, which are not implemented.
+    bool live_inputs = false;
+
+    // Wall-clock idleness for live inputs (requires live_inputs). A channel that
+    // has produced no item for this long is excluded from the watermark minimum
+    // and the barrier alignment set, exactly like logical idleness, and rejoins
+    // when it produces again. Zero disables it.
+    std::chrono::milliseconds idle_timeout_wall{0};
 
     // v3 Phase 2 idleness policy. A source is marked IDLE (excluded from the MIN)
     // after this many CONSECUTIVE empty pulls — round-robin turns on which it
@@ -187,6 +208,10 @@ public:
     /// Channel descriptors, their idle spans, and the idle timeout. Empty if any
     /// channel is itself undescribed, since the merge can then not be validated.
     [[nodiscard]] std::string Descriptor() const override;
+    /// False for live_inputs or when any channel is not replayable.
+    [[nodiscard]] bool Replayable() const override;
+    /// Forwards to every channel.
+    void Cancel() override;
 
     /// The current merged watermark (running min across channels). Exposed for
     /// tests that assert the lagging-source-holds-the-min behavior end-to-end.
@@ -212,7 +237,8 @@ public:
     }
 
 private:
-    enum class StepResult { kProduced, kExhausted };
+    enum class StepResult { kProduced, kNoData, kExhausted };
+    enum class PullResult { kItem, kNoData, kExhausted };
 
     struct SourceState {
         std::unique_ptr<Source> source;
@@ -227,6 +253,7 @@ private:
         uint64_t data_pulled = 0;           // this source's own data-record index
         uint64_t consecutive_empty = 0;     // consecutive empty pulls (resets on any output)
         bool idle = false;                  // excluded from the MIN (idle_timeout tripped)
+        std::chrono::steady_clock::time_point last_item;  // live inputs: last item produced
 
         // --- v3 Phase 3 alignment state ---
         uint64_t barriers_seen = 0;         // per-source barriers delivered into alignment
@@ -236,7 +263,10 @@ private:
     /// Rewind every channel's merge bookkeeping to the start of the stream. The
     /// wrapped sources themselves are rewound by Seek, not here.
     void ResetProgress();
-    bool PullNextItem(std::size_t i, BatchItem& out);
+    PullResult PullNextItem(std::size_t i, BatchItem& out);
+    /// Exclude channel i from the watermark MIN and alignment set, emitting any
+    /// merged watermark or barrier that exclusion releases.
+    void MarkChannelIdle(std::size_t i, Batch& out);
     StepResult ProduceOneMergedStep(Batch& out, std::size_t& data_in_batch);
     [[nodiscard]] bool AllExhausted() const;
 
