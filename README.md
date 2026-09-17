@@ -184,19 +184,22 @@ The matched Flink runbook is in [`bench/flink`](bench/flink/README.md).
 stormglass is a research engine hardened through deterministic testing and
 measurement. Its current boundaries are explicit:
 
-- The native router/worker path is single-process. `SourceMerge` models K inputs through
-  deterministic round-robin pulls rather than concurrent broker or socket
-  consumers.
+- The native router/worker path is single-process. `SourceMerge` combines K
+  replayable `Source` inputs through deterministic round-robin pulls rather than
+  concurrent broker or socket consumers. Restore replays every input from its
+  start because no per-input offset vector is persisted.
 - The TCP snapshot path supports fixed, configured peer connections and replayable
   application sources; its process tests use generated input. There is no Kafka,
   CDC, dynamic membership or authenticated network deployment integration.
-- Checkpoints protect operator state. There is no transactional sink, input
-  event-ID deduplication, or general end-to-end exactly-once guarantee.
+- Checkpoints protect operator state, and output reaches the sink before each
+  checkpoint, so recovery is at-least-once. There is no transactional sink,
+  input event-ID deduplication, or general end-to-end exactly-once guarantee.
 - Checkpoint history for partitioned jobs is retained without coordinated
   pruning, so disk use and recovery scans grow over time.
 - Restore requires stable worker count, window configuration, source ordering,
-  lateness, and barrier cadence. State has no persisted configuration
-  fingerprint or rescaling protocol.
+  lateness, and barrier cadence. A persisted job manifest rejects changes to
+  them; custom assigners and sources must implement `Descriptor()` to take part.
+  There is no rescaling protocol.
 - Checkpoint serialization pauses the operator; asynchronous snapshotting is a
   future optimization.
 

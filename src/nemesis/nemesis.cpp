@@ -317,7 +317,7 @@ GeneratorConfig MakeRealGenConfig(const RealKillConfig& config) {
 void RunRealKillChild(const RealKillConfig& config, const std::string& ckpt_dir,
                       const std::string& sink_path, const std::string& sentinel_path) {
     auto gen = std::make_unique<DeterministicGenerator>(MakeRealGenConfig(config));
-    auto sink = std::make_unique<DurableFileSink>(sink_path);
+    auto sink = std::make_unique<DurableFileSink>(sink_path, DurableFileSink::OpenMode::kTruncate);
     auto assigner = std::make_unique<TumblingAssigner>(config.window_size);
 
     PipelineConfig pconfig{};
@@ -457,7 +457,7 @@ RealKillResult RunRealKillNemesis(const RealKillConfig& config) {
     //     (if any) is discarded by the reader's stale-.tmp recovery. ---
     {
         auto gen = std::make_unique<DeterministicGenerator>(MakeRealGenConfig(config));
-        auto sink = std::make_unique<DurableFileSink>(sink_post);
+        auto sink = std::make_unique<DurableFileSink>(sink_post, DurableFileSink::OpenMode::kTruncate);
         auto assigner = std::make_unique<TumblingAssigner>(config.window_size);
 
         PipelineConfig pconfig{};
@@ -570,7 +570,8 @@ GeneratorConfig MakePartGenConfig(const PartitionedRealKillConfig& config) {
 std::function<std::unique_ptr<Sink>(uint32_t)> MakeDurableFactory(
     const std::string& prefix) {
     return [prefix](uint32_t k) -> std::unique_ptr<Sink> {
-        return std::make_unique<DurableFileSink>(prefix + std::to_string(k) + ".bin");
+        return std::make_unique<DurableFileSink>(prefix + std::to_string(k) + ".bin",
+                                                 DurableFileSink::OpenMode::kTruncate);
     };
 }
 
@@ -855,6 +856,7 @@ public:
     }
     void Seek(uint64_t offset) override { merge_.Seek(offset); }
     [[nodiscard]] uint64_t CurrentOffset() const override { return merge_.CurrentOffset(); }
+    [[nodiscard]] std::string Descriptor() const override { return merge_.Descriptor(); }
 
 private:
     void WriteMarker() {
@@ -967,7 +969,7 @@ void RunAlignmentKillChild(const AlignmentKillConfig& config,
     auto mc = MakeAlignmentMergeConfig(config);
     auto source = std::make_unique<AlignmentProbeSource>(mc, marker_path,
                                                          mc.sources.size());
-    auto sink = std::make_unique<DurableFileSink>(sink_path);
+    auto sink = std::make_unique<DurableFileSink>(sink_path, DurableFileSink::OpenMode::kTruncate);
     auto assigner = std::make_unique<TumblingAssigner>(config.window_size);
 
     PipelineConfig pconfig{};
@@ -1100,7 +1102,7 @@ AlignmentKillResult RunAlignmentKillNemesis(const AlignmentKillConfig& config) {
     {
         auto mc = MakeAlignmentMergeConfig(config);
         auto source = std::make_unique<SourceMerge>(mc);  // no probe needed on restore
-        auto sink = std::make_unique<DurableFileSink>(sink_post);
+        auto sink = std::make_unique<DurableFileSink>(sink_post, DurableFileSink::OpenMode::kTruncate);
         auto assigner = std::make_unique<TumblingAssigner>(config.window_size);
 
         PipelineConfig pconfig{};

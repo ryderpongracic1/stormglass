@@ -9,4 +9,7 @@ std::vector<Window> TumblingAssigner::AssignWindows(Timestamp event_time) const 
     auto start_ms = (ms / window_ms) * window_ms;
     return {{Timestamp{Duration{start_ms}}, Timestamp{Duration{start_ms + window_ms}}}};
 }
+std::string TumblingAssigner::Descriptor() const {
+    return "tumbling(size_ms=" + std::to_string(size_.count()) + ")";
+}
 } // namespace stormglass

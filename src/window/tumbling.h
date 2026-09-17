@@ -8,6 +8,7 @@ public:
         if (size.count() <= 0) throw std::invalid_argument("window size must be positive");
     }
     std::vector<Window> AssignWindows(Timestamp event_time) const override;
+    std::string Descriptor() const override;
 private:
     Duration size_;
 };

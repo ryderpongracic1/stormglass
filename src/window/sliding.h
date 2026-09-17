@@ -8,6 +8,7 @@ class SlidingAssigner : public WindowAssigner {
 public:
     SlidingAssigner(Duration window_size, Duration slide_interval);
     std::vector<Window> AssignWindows(Timestamp event_time) const override;
+    std::string Descriptor() const override;
 
 private:
     Duration window_size_;

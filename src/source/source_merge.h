@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace stormglass {
@@ -94,6 +95,18 @@ private:
     Timestamp emitted_{Timestamp::min()};
 };
 
+/// One input channel for SourceMerge's general constructor: any replayable
+/// Source plus the idle spans SourceMerge should model on it.
+///
+/// The source owns its own watermarks and barriers. It must be deterministic
+/// from the start (Seek(0) followed by Next() replays the identical trajectory),
+/// because SourceMerge::Seek replays every channel from offset 0 to rebuild the
+/// merged interleaving and alignment state.
+struct SourceMergeInput {
+    std::unique_ptr<Source> source;
+    std::vector<IdleSpan> idle_spans;  // sorted by start_offset, non-overlapping
+};
+
 /// Configuration for a SourceMerge: K underlying DeterministicGenerators plus
 /// the merged-stream barrier interval. Give the per-source GeneratorConfigs
 /// DIVERGENT event_time_step / seed so their watermarks advance at different
@@ -163,9 +176,17 @@ class SourceMerge : public Source {
 public:
     explicit SourceMerge(SourceMergeConfig config);
 
+    /// Merge arbitrary Source channels. `options` supplies merged_batch_size and
+    /// idle_timeout; its `sources` must be empty and its checkpoint_interval 0,
+    /// since channels emit their own barriers (std::invalid_argument otherwise).
+    SourceMerge(std::vector<SourceMergeInput> inputs, SourceMergeConfig options);
+
     std::optional<Batch> Next() override;
     void Seek(uint64_t offset) override;
     [[nodiscard]] uint64_t CurrentOffset() const override;
+    /// Channel descriptors, their idle spans, and the idle timeout. Empty if any
+    /// channel is itself undescribed, since the merge can then not be validated.
+    [[nodiscard]] std::string Descriptor() const override;
 
     /// The current merged watermark (running min across channels). Exposed for
     /// tests that assert the lagging-source-holds-the-min behavior end-to-end.
@@ -194,14 +215,13 @@ private:
     enum class StepResult { kProduced, kExhausted };
 
     struct SourceState {
-        GeneratorConfig config;                       // checkpoint_interval forced to 0
-        std::unique_ptr<DeterministicGenerator> gen;
+        std::unique_ptr<Source> source;
         Batch buf;                                    // current buffered batch
         std::size_t cursor = 0;                       // index into buf.items
         bool exhausted = false;
 
         // --- v3 Phase 2 idle-span modeling + detection state ---
-        std::vector<IdleSpan> idle_spans;   // copied from config.idle_spans (sorted)
+        std::vector<IdleSpan> idle_spans;   // sorted by start_offset
         std::size_t next_span = 0;          // index of the next span to fire
         uint64_t gap_remaining = 0;         // idle ticks left in the current gap (0 = live)
         uint64_t data_pulled = 0;           // this source's own data-record index
@@ -212,7 +232,10 @@ private:
         uint64_t barriers_seen = 0;         // per-source barriers delivered into alignment
     };
 
-    void ResetState();
+    void AddInput(std::unique_ptr<Source> source, std::vector<IdleSpan> idle_spans);
+    /// Rewind every channel's merge bookkeeping to the start of the stream. The
+    /// wrapped sources themselves are rewound by Seek, not here.
+    void ResetProgress();
     bool PullNextItem(std::size_t i, BatchItem& out);
     StepResult ProduceOneMergedStep(Batch& out, std::size_t& data_in_batch);
     [[nodiscard]] bool AllExhausted() const;

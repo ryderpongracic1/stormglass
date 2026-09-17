@@ -3,6 +3,8 @@
 #include <cerrno>
 #include <cstdint>
 #include <fcntl.h>
+#include <map>
+#include <tuple>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <system_error>
@@ -46,11 +48,81 @@ uint64_t ReadLE64(const uint8_t* p) {
     return v;
 }
 
+// Parse complete records from `data`, stopping at a torn trailing record.
+// Returns the byte length of the valid prefix.
+size_t ParseRecords(const std::vector<uint8_t>& data, std::vector<WindowResult>* results) {
+    size_t pos = 0;
+    while (pos + 4 <= data.size()) {
+        uint32_t key_len = ReadLE32(data.data() + pos);
+        // Full record = 4 (key_len) + key_len + 8+8+8+8 (start,end,sum,count).
+        size_t record_size = 4 + static_cast<size_t>(key_len) + 32;
+        if (pos + record_size > data.size()) {
+            break;  // Torn trailing record — writer was killed mid-append.
+        }
+        if (results) {
+            size_t p = pos + 4;
+            std::string key(reinterpret_cast<const char*>(data.data() + p), key_len);
+            p += key_len;
+            int64_t start = static_cast<int64_t>(ReadLE64(data.data() + p)); p += 8;
+            int64_t end = static_cast<int64_t>(ReadLE64(data.data() + p)); p += 8;
+            int64_t sum = static_cast<int64_t>(ReadLE64(data.data() + p)); p += 8;
+            uint64_t count = ReadLE64(data.data() + p);
+
+            results->push_back(WindowResult{
+                .key = std::move(key),
+                .window = Window{Timestamp{Duration{start}}, Timestamp{Duration{end}}},
+                .result = AggregateResult{sum, count},
+            });
+        }
+        pos += record_size;
+    }
+    return pos;
+}
+
+// Read the whole file behind `fd` from offset 0. Throws on read errors so a
+// short read is never mistaken for a torn tail and truncated away.
+std::vector<uint8_t> ReadFd(int fd) {
+    struct stat st{};
+    if (::fstat(fd, &st) != 0)
+        throw std::system_error(errno, std::generic_category(), "stat sink");
+    std::vector<uint8_t> data(static_cast<size_t>(st.st_size));
+    size_t total = 0;
+    while (total < data.size()) {
+        auto n = ::pread(fd, data.data() + total, data.size() - total,
+                         static_cast<off_t>(total));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) throw std::system_error(errno, std::generic_category(), "read sink");
+        if (n == 0) break;
+        total += static_cast<size_t>(n);
+    }
+    data.resize(total);
+    return data;
+}
+
 } // namespace
 
-DurableFileSink::DurableFileSink(const std::string& path) {
-    fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+DurableFileSink::DurableFileSink(const std::string& path, OpenMode mode) {
+    if (mode == OpenMode::kTruncate) {
+        fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_ < 0) throw std::system_error(errno, std::generic_category(), "open sink");
+        return;
+    }
+
+    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND, 0644);
     if (fd_ < 0) throw std::system_error(errno, std::generic_category(), "open sink");
+    try {
+        const auto data = ReadFd(fd_);
+        const size_t valid = ParseRecords(data, nullptr);
+        if (valid != data.size()) {
+            if (::ftruncate(fd_, static_cast<off_t>(valid)) != 0)
+                throw std::system_error(errno, std::generic_category(), "truncate torn sink tail");
+            Flush();
+        }
+    } catch (...) {
+        ::close(fd_);
+        fd_ = -1;
+        throw;
+    }
 }
 
 DurableFileSink::~DurableFileSink() {
@@ -88,52 +160,31 @@ std::vector<WindowResult> DurableFileSink::ReadAll(const std::string& path) {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return results;
 
-    struct stat st{};
-    if (::fstat(fd, &st) != 0) {
+    std::vector<uint8_t> data;
+    try {
+        data = ReadFd(fd);
+    } catch (const std::system_error&) {
         ::close(fd);
         return results;
     }
-
-    std::vector<uint8_t> data(static_cast<size_t>(st.st_size));
-    size_t total = 0;
-    while (total < data.size()) {
-        auto n = ::read(fd, data.data() + total, data.size() - total);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            break;
-        }
-        total += static_cast<size_t>(n);
-    }
     ::close(fd);
-    data.resize(total);
 
-    size_t pos = 0;
-    while (pos + 4 <= data.size()) {
-        uint32_t key_len = ReadLE32(data.data() + pos);
-        // Full record = 4 (key_len) + key_len + 8+8+8+8 (start,end,sum,count).
-        size_t record_size = 4 + static_cast<size_t>(key_len) + 32;
-        if (pos + record_size > data.size()) {
-            break;  // Torn trailing record — writer was killed mid-append.
-        }
-
-        size_t p = pos + 4;
-        std::string key(reinterpret_cast<const char*>(data.data() + p), key_len);
-        p += key_len;
-        int64_t start = static_cast<int64_t>(ReadLE64(data.data() + p)); p += 8;
-        int64_t end = static_cast<int64_t>(ReadLE64(data.data() + p)); p += 8;
-        int64_t sum = static_cast<int64_t>(ReadLE64(data.data() + p)); p += 8;
-        uint64_t count = ReadLE64(data.data() + p); p += 8;
-
-        results.push_back(WindowResult{
-            .key = std::move(key),
-            .window = Window{Timestamp{Duration{start}}, Timestamp{Duration{end}}},
-            .result = AggregateResult{sum, count},
-        });
-
-        pos += record_size;
-    }
-
+    ParseRecords(data, &results);
     return results;
+}
+
+std::vector<WindowResult> DurableFileSink::ReadLatest(const std::string& path) {
+    using Slot = std::tuple<int64_t, std::string, int64_t>;  // start, key, end
+    std::map<Slot, WindowResult> latest;
+    for (auto& r : ReadAll(path)) {
+        Slot slot{r.window.start.time_since_epoch().count(), r.key,
+                  r.window.end.time_since_epoch().count()};
+        latest.insert_or_assign(std::move(slot), std::move(r));
+    }
+    std::vector<WindowResult> out;
+    out.reserve(latest.size());
+    for (auto& [slot, r] : latest) out.push_back(std::move(r));
+    return out;
 }
 
 } // namespace stormglass

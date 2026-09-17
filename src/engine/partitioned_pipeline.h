@@ -32,14 +32,16 @@ struct PartitionedPipelineConfig {
     // Phase 0-2. When set, each worker k snapshots on every broadcast barrier
     // into <checkpoint_dir>/p<k> (see distributed_checkpoint.h), and Run() first
     // restores from the highest COMPLETE global checkpoint and seeks the source
-    // past it.
+    // past it. The directory's job manifest (see job_manifest.h) pins worker
+    // count, lateness, assigner and source descriptors; Run() throws
+    // JobManifestMismatch rather than restoring under a different configuration.
     std::string checkpoint_dir;
 
     // Optional per-worker sink factory. When set, worker k emits directly to
-    // worker_sink_factory(k) instead of an internal MemorySink merged into the
-    // constructor's sink at join. Used by the partitioned real-kill nemesis so
-    // each worker's pre-crash output is independently durable. Null (default)
-    // keeps the original merge-into-caller-sink path byte-for-byte.
+    // worker_sink_factory(k) instead of forwarding into the constructor's sink.
+    // Used by the partitioned real-kill nemesis so each worker's pre-crash
+    // output is independently durable. Null (default) forwards every worker's
+    // output into the constructor's sink while the job runs.
     std::function<std::unique_ptr<Sink>(uint32_t)> worker_sink_factory = nullptr;
 };
 
@@ -54,13 +56,16 @@ struct PartitionedPipelineConfig {
 //     KeyedWindowState, WatermarkTracker, assigner) and its local sink. It
 //     fires/drops its disjoint keys against the broadcast GLOBAL watermark, so
 //     its decisions match the single-threaded engine's for those keys.
-//   * The Merge stage (the thread calling Run) joins all workers, unions their
-//     outputs into the caller's sink, and reports the effective output
-//     watermark = min across per-partition watermarks.
+//   * Output: each worker forwards its results into the caller's sink after
+//     every input batch and before every checkpoint, serialized by one mutex,
+//     so the caller's sink is called from worker threads (never concurrently)
+//     and output committed before a checkpoint survives a later failure.
+//   * The Merge stage (the thread calling Run) joins all workers and reports
+//     the effective output watermark = min across per-partition watermarks.
 //
-// The only shared memory is the per-worker BoundedQueue and, after join, the
-// worker result buffers. Output ORDER across workers is nondeterministic;
-// compare results as a SET (sort by (window.start, key)).
+// The only shared memory is the per-worker BoundedQueue and the mutex-guarded
+// caller sink. Output ORDER across workers is nondeterministic; compare results
+// as a SET (sort by (window.start, key)).
 class PartitionedPipeline {
 public:
     // assigner_factory is called once per worker so each worker owns its own

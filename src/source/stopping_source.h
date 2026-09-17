@@ -16,6 +16,8 @@ public:
     std::optional<Batch> Next() override;
     void Seek(uint64_t offset) override;
     [[nodiscard]] uint64_t CurrentOffset() const override;
+    // Stopping early truncates the stream but does not change its identity.
+    [[nodiscard]] std::string Descriptor() const override { return inner_->Descriptor(); }
 
 private:
     std::unique_ptr<Source> inner_;

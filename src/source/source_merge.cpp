@@ -11,31 +11,76 @@ SourceMerge::SourceMerge(SourceMergeConfig config)
     : config_(std::move(config)),
       combiner_(std::max<std::size_t>(1, config_.sources.size())) {
     if (config_.merged_batch_size == 0) throw std::invalid_argument("merged batch size must be positive");
-    ResetState();
-}
-
-void SourceMerge::ResetState() {
-    states_.clear();
-    states_.reserve(config_.sources.size());
     for (const auto& src : config_.sources) {
-        SourceState st;
-        st.config = src;
         // v3 Phase 3: wrapped sources emit their OWN barriers now (Phase 1/2 forced
         // this to 0). EffectiveInterval picks the source's own checkpoint_interval,
         // else the merged-config default; SourceMerge aligns the resulting per-source
         // barriers K-way. 0 (both) == this source emits no barriers.
-        st.config.checkpoint_interval = EffectiveInterval(src);
-        st.gen = std::make_unique<DeterministicGenerator>(st.config);
+        GeneratorConfig gen = src;
+        gen.checkpoint_interval = EffectiveInterval(src);
         // Idle spans are modeled by SourceMerge (it pauses the wrapped generator
-        // for the span); the generator itself ignores them. Copy them out so the
-        // per-source detection state is self-contained.
-        st.idle_spans = src.idle_spans;
-        states_.push_back(std::move(st));
+        // for the span); the generator itself ignores them.
+        AddInput(std::make_unique<DeterministicGenerator>(gen), src.idle_spans);
     }
-    combiner_ = MinWatermarkCombiner(std::max<std::size_t>(1, config_.sources.size()));
+    ResetProgress();
+}
+
+SourceMerge::SourceMerge(std::vector<SourceMergeInput> inputs, SourceMergeConfig options)
+    : config_(std::move(options)),
+      combiner_(std::max<std::size_t>(1, inputs.size())) {
+    if (config_.merged_batch_size == 0) throw std::invalid_argument("merged batch size must be positive");
+    if (!config_.sources.empty())
+        throw std::invalid_argument("SourceMerge inputs and generator configs cannot be mixed");
+    if (config_.checkpoint_interval != 0)
+        throw std::invalid_argument("SourceMerge inputs emit their own barriers; checkpoint_interval must be 0");
+    for (auto& input : inputs) {
+        if (!input.source) throw std::invalid_argument("SourceMerge input source is null");
+        AddInput(std::move(input.source), std::move(input.idle_spans));
+    }
+    ResetProgress();
+}
+
+void SourceMerge::AddInput(std::unique_ptr<Source> source, std::vector<IdleSpan> idle_spans) {
+    for (std::size_t i = 1; i < idle_spans.size(); ++i) {
+        if (idle_spans[i].start_offset < idle_spans[i - 1].start_offset)
+            throw std::invalid_argument("idle spans must be sorted by start_offset");
+    }
+    SourceState st;
+    st.source = std::move(source);
+    st.idle_spans = std::move(idle_spans);
+    states_.push_back(std::move(st));
+}
+
+void SourceMerge::ResetProgress() {
+    for (SourceState& st : states_) {
+        st.buf = Batch{};
+        st.cursor = 0;
+        st.exhausted = false;
+        st.next_span = 0;
+        st.gap_remaining = 0;
+        st.data_pulled = 0;
+        st.consecutive_empty = 0;
+        st.idle = false;
+        st.barriers_seen = 0;
+    }
+    combiner_ = MinWatermarkCombiner(std::max<std::size_t>(1, states_.size()));
     rr_ = 0;
     merged_offset_ = 0;
     epoch_closed_ = 0;
+}
+
+std::string SourceMerge::Descriptor() const {
+    std::string out = "merge(idle_timeout=" + std::to_string(config_.idle_timeout);
+    for (const SourceState& st : states_) {
+        const std::string channel = st.source->Descriptor();
+        if (channel.empty()) return "";
+        out += ";" + channel;
+        for (const auto& span : st.idle_spans) {
+            out += "@idle(" + std::to_string(span.start_offset) + "," +
+                   std::to_string(span.length) + ")";
+        }
+    }
+    return out + ")";
 }
 
 bool SourceMerge::PullNextItem(std::size_t i, BatchItem& out) {
@@ -44,7 +89,7 @@ bool SourceMerge::PullNextItem(std::size_t i, BatchItem& out) {
     // from DeterministicGenerator are non-empty until exhaustion, so this loops
     // at most once in practice; the guard keeps it robust.
     while (st.cursor >= st.buf.items.size()) {
-        auto batch = st.gen->Next();
+        auto batch = st.source->Next();
         if (!batch.has_value()) {
             st.exhausted = true;
             return false;
@@ -240,13 +285,15 @@ std::optional<Batch> SourceMerge::Next() {
 }
 
 void SourceMerge::Seek(uint64_t offset) {
-    // Re-seed ALL wrapped sources and replay the merged production to `offset`
+    // Rewind ALL wrapped sources and replay the merged production to `offset`
     // merged DATA records, mirroring the single generator's O(offset) Seek. The
     // combiner, round-robin cursor, and barrier counter are members updated by
     // ProduceOneMergedStep, so replaying reproduces the exact internal state a
     // non-seeked run holds at the same offset — and thus the identical merged
-    // sequence afterward.
-    ResetState();
+    // sequence afterward. The merged offset does not determine per-channel
+    // offsets, so every channel must replay from its own start.
+    for (SourceState& st : states_) st.source->Seek(0);
+    ResetProgress();
 
     Batch scratch;
     std::size_t dib = 0;

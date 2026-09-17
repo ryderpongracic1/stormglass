@@ -1,5 +1,7 @@
 #include "engine/pipeline.h"
 
+#include "checkpoint/job_manifest.h"
+
 #include <variant>
 #include <stdexcept>
 
@@ -28,6 +30,12 @@ bool Pipeline::checkpointing_enabled() const {
 }
 
 void Pipeline::TryRestore() {
+    ValidateOrCreateJobManifest(config_.checkpoint_dir, JobManifest{
+        {"engine", "pipeline"},
+        {"allowed_lateness_ms", std::to_string(config_.allowed_lateness.count())},
+        {"assigner", assigner_->Descriptor()},
+        {"source", source_->Descriptor()},
+    });
     CheckpointReader reader(config_.checkpoint_dir);
     auto data = reader.LoadLatest();
     if (!data.has_value()) return;

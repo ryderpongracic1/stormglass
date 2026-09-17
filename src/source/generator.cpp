@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <sstream>
 #include <stdexcept>
 
 namespace stormglass {
@@ -153,6 +154,24 @@ void DeterministicGenerator::Seek(uint64_t offset) {
 
 uint64_t DeterministicGenerator::CurrentOffset() const {
     return offset_;
+}
+
+std::string DeterministicGenerator::Descriptor() const {
+    std::ostringstream out;
+    out.precision(17);
+    out << "generator(seed=" << config_.seed
+        << ",keys=" << config_.num_keys
+        << ",step_ms=" << config_.event_time_step
+        << ",disorder_ms=" << config_.max_disorder.count()
+        << ",watermark_interval=" << config_.watermark_interval
+        << ",checkpoint_interval=" << config_.checkpoint_interval
+        << ",disorder_mode=" << static_cast<int>(config_.disorder_mode);
+    if (config_.disorder_mode == DisorderMode::kHeavyTailed) {
+        out << ",late_fraction=" << config_.late_fraction
+            << ",late_tail_ms=" << config_.late_tail.count();
+    }
+    out << ")";
+    return out.str();
 }
 
 } // namespace stormglass
