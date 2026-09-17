@@ -4,8 +4,8 @@
 #include "engine/keyed_processor.h"
 #include "engine/partition_hash.h"
 #include "checkpoint/distributed_checkpoint.h"
+#include "checkpoint/job_manifest.h"
 #include "checkpoint/reader.h"
-#include "sink/memory_sink.h"
 
 #include <algorithm>
 #include <atomic>
@@ -38,17 +38,57 @@ using WorkerMessage = std::variant<Record, ControlRecord, EndOfStream>;
 // order within a batch and batches are enqueued strictly FIFO.
 using WorkerBatch = std::vector<WorkerMessage>;
 
+// Worker-local front for the caller's shared sink. Results are buffered only
+// until the worker finishes its current input batch (Drain) or reaches a
+// barrier / final flush (Flush), then handed to the caller's sink under one
+// mutex, so the caller's sink sees serialized calls and never holds more than a
+// batch of undelivered output.
+//
+// Flush ordering is the recovery invariant: KeyedProcessor flushes its sink
+// before writing a checkpoint, so every result whose window the checkpoint
+// records as fired has already reached (and been flushed by) the caller's sink.
+// A failure after that checkpoint can therefore lose no output; replay from it
+// can only repeat results emitted later (at-least-once).
+class ForwardingSink : public Sink {
+public:
+    ForwardingSink(Sink& downstream, std::mutex& mu) : downstream_(downstream), mu_(mu) {}
+
+    void Emit(const WindowResult& result) override { pending_.push_back(result); }
+
+    void Flush() override {
+        std::lock_guard lock(mu_);
+        DeliverLocked();
+        downstream_.Flush();
+    }
+
+    void Drain() {
+        if (pending_.empty()) return;
+        std::lock_guard lock(mu_);
+        DeliverLocked();
+    }
+
+private:
+    void DeliverLocked() {
+        for (const auto& result : pending_) downstream_.Emit(result);
+        pending_.clear();
+    }
+
+    Sink& downstream_;
+    std::mutex& mu_;
+    std::vector<WindowResult> pending_;
+};
+
 // One shared-nothing worker: owns a bounded input queue, a local sink, and a
 // KeyedProcessor over its subset of keys.
 struct Worker {
     explicit Worker(std::size_t queue_capacity) : queue(queue_capacity) {}
 
     BoundedQueue<WorkerBatch> queue;
-    // Worker sink: either an internal MemorySink (mem_sink non-null, merged into
-    // the caller's sink at join) or a caller-supplied durable sink (mem_sink
-    // null, self-persisting). Held by unique_ptr so both cases share one path.
+    // Worker sink: either a ForwardingSink into the caller's sink (forward
+    // non-null) or a caller-supplied per-worker sink (forward null,
+    // self-persisting). Held by unique_ptr so both cases share one path.
     std::unique_ptr<Sink> sink;
-    MemorySink* mem_sink = nullptr;
+    ForwardingSink* forward = nullptr;
     std::unique_ptr<KeyedProcessor> processor;
     std::thread thread;
     std::string ckpt_dir;  // per-partition checkpoint dir, or empty
@@ -70,6 +110,19 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
     const uint32_t n = std::max<uint32_t>(1, config_.num_workers);
     const bool checkpointing = !config_.checkpoint_dir.empty();
 
+    // Reject a checkpoint directory from a different job shape before touching
+    // any state: partition files are only meaningful to the same worker count,
+    // window geometry, lateness, and replayed source.
+    if (checkpointing) {
+        ValidateOrCreateJobManifest(config_.checkpoint_dir, JobManifest{
+            {"engine", "partitioned"},
+            {"num_workers", std::to_string(n)},
+            {"allowed_lateness_ms", std::to_string(config_.allowed_lateness.count())},
+            {"assigner", assigner_factory_()->Descriptor()},
+            {"source", source_->Descriptor()},
+        });
+    }
+
     // Per-partition checkpoint directories must exist before any worker writes.
     // create_directories is idempotent, so both the initial run and a restart
     // (restore) run land on the same layout.
@@ -81,6 +134,7 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
     }
 
     // --- Build workers (each owns its state, assigner, and local sink) ---
+    std::mutex sink_mutex;
     std::vector<std::unique_ptr<Worker>> workers;
     workers.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
@@ -91,9 +145,9 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
         if (config_.worker_sink_factory) {
             w->sink = config_.worker_sink_factory(i);
         } else {
-            auto mem = std::make_unique<MemorySink>();
-            w->mem_sink = mem.get();
-            w->sink = std::move(mem);
+            auto forward = std::make_unique<ForwardingSink>(*sink_, sink_mutex);
+            w->forward = forward.get();
+            w->sink = std::move(forward);
         }
         w->processor = std::make_unique<KeyedProcessor>(
             assigner_factory_(), *w->sink, config_.allowed_lateness, w->ckpt_dir);
@@ -178,6 +232,7 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
                     }, msg);
                     if (stop) { done = true; break; }
                 }
+                if (w->forward) w->forward->Drain();
             }
             if (!cancelled.load()) w->processor->FinalFlush();
           } catch (...) { fail(); }
@@ -242,18 +297,10 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
 
     if (error) std::rethrow_exception(error);
 
-    // --- Merge: union worker outputs into the caller's sink + aggregate stats ---
+    // --- Merge: aggregate stats (output was already forwarded while running) ---
     stats.num_workers = n;
     Timestamp min_wm = Timestamp::max();
     for (uint32_t i = 0; i < n; ++i) {
-        // Internal MemorySink workers merge into the caller's sink. Workers with
-        // a caller-supplied durable sink have already persisted independently, so
-        // there is nothing to merge (mem_sink is null).
-        if (workers[i]->mem_sink) {
-            for (const auto& result : workers[i]->mem_sink->Results()) {
-                sink_->Emit(result);
-            }
-        }
         const auto& ws = workers[i]->processor->stats();
         // Disjoint-key quantities sum to the single-threaded totals.
         stats.records_processed += ws.records_processed;

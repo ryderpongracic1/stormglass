@@ -44,4 +44,9 @@ std::vector<Window> SlidingAssigner::AssignWindows(Timestamp event_time) const {
     return windows;
 }
 
+std::string SlidingAssigner::Descriptor() const {
+    return "sliding(size_ms=" + std::to_string(window_size_.count()) +
+           ",slide_ms=" + std::to_string(slide_.count()) + ")";
+}
+
 } // namespace stormglass

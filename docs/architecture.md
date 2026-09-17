@@ -17,29 +17,29 @@ SourceMerge ── records + merged watermarks + aligned barriers
    ▼
 Router ─────── FNV-1a(key) % N
    │
-   ├── worker 0: queue → KeyedProcessor → private state → private sink
-   ├── worker 1: queue → KeyedProcessor → private state → private sink
-   └── worker N: queue → KeyedProcessor → private state → private sink
+   ├── worker 0: queue → KeyedProcessor → private state → output buffer
+   ├── worker 1: queue → KeyedProcessor → private state → output buffer
+   └── worker N: queue → KeyedProcessor → private state → output buffer
    │
    ▼
-join + result union + minimum output watermark
+caller sink (serialized) + join + minimum output watermark
 ```
 
 The source and router run together on one router thread. Each worker runs on its
-own thread. The caller joins the router and workers before reading worker
-statistics or merging in-memory results.
+own thread and forwards its results into the caller's sink while the job runs.
+The caller joins the router and workers before reading worker statistics.
 
 ## Components
 
 | Component | Responsibility |
 |---|---|
 | `Source` | Produces batches containing records and in-band control records |
-| `SourceMerge` | Deterministically interleaves K sources, combines watermarks, detects logical idleness, and aligns barriers |
-| `PartitionedPipeline` | Builds workers, routes records, broadcasts control records, manages shutdown, and merges results |
+| `SourceMerge` | Deterministically interleaves K replayable `Source` channels, combines watermarks, detects logical idleness, and aligns barriers |
+| `PartitionedPipeline` | Validates the checkpoint job manifest, builds workers, routes records, broadcasts control records, forwards results, and manages shutdown |
 | `KeyedProcessor` | Applies window assignments, updates aggregates, advances watermarks, fires windows, and writes snapshots |
 | `KeyedWindowState` | Owns active panes, fired panes retained for lateness, and pending re-fire state |
 | `CheckpointWriter` / `Reader` | Serialize, sync, validate, and restore partition state |
-| `Sink` | Receives window results; implementations include memory, stdout, and durable crash-harness sinks |
+| `Sink` | Receives window results; implementations include memory, stdout, and an append-safe durable file sink |
 
 ## Keyed execution
 
@@ -48,8 +48,12 @@ subsets rather than contiguous key ranges. Every record for a key reaches the
 same worker for a fixed worker count, including after deterministic replay.
 
 Workers share no window state. Each owns its assigner, watermark tracker,
-`KeyedWindowState`, and sink. The only concurrent handoff is the bounded queue
-between the router and each worker.
+`KeyedWindowState`, and output buffer. There are two concurrent handoffs: the
+bounded queue between the router and each worker, and the caller's sink.
+Workers hand buffered results to that sink under one mutex after every input
+batch and before every checkpoint, so the sink sees serialized calls from worker
+threads and holds every result a checkpoint marks as fired. A per-worker
+`worker_sink_factory` bypasses the shared sink entirely.
 
 A queue element is a batch of messages routed from one source batch. The router
 preserves source order inside every worker batch and enqueues batches FIFO. This
@@ -65,7 +69,11 @@ data and control batch.
 
 `SourceMerge` wraps K sources and exposes the ordinary `Source` interface. It
 pulls channels in deterministic round-robin order and maintains per-channel
-watermark, idle, exhausted, and barrier state.
+watermark, idle, exhausted, and barrier state. Channels are either generator
+configurations it builds itself or arbitrary `Source` objects
+(`SourceMergeInput`) that emit their own watermarks and barriers. `Seek(O)`
+rewinds every channel to offset 0 and replays the merge to O, because the
+merged offset does not identify per-channel positions.
 
 The emitted watermark is the monotonically increasing minimum across active
 channels. A channel that exceeds the configured number of consecutive empty

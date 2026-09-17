@@ -77,6 +77,10 @@ public:
     std::optional<Batch> Next() override;
     void Seek(uint64_t offset) override;
     [[nodiscard]] uint64_t CurrentOffset() const override;
+    // Seed, key space, event-time and disorder shape, and watermark/barrier
+    // cadence. num_records and batch_size are excluded: a longer or re-batched
+    // stream replays the same prefix.
+    [[nodiscard]] std::string Descriptor() const override;
 
 private:
     Record GenerateRecord();

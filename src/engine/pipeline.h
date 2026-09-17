@@ -18,7 +18,9 @@ struct PipelineConfig {
     Duration allowed_lateness{0};
 
     // Checkpoint config
-    std::string checkpoint_dir;         // empty = no checkpointing
+    // Empty = no checkpointing. Restore throws JobManifestMismatch if the
+    // directory was written with a different lateness, assigner or source.
+    std::string checkpoint_dir;
     uint64_t checkpoint_interval = 0;   // records between checkpoints (0 = disabled)
 };
 

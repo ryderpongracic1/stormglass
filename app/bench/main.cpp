@@ -267,9 +267,9 @@ static void BenchmarkCheckpointOverhead() {
         return;
     }
     std::string dir = d;
+    GeneratorConfig g = ScalingGenConfig();
+    g.checkpoint_interval = kCkptInterval;
     {
-        GeneratorConfig g = ScalingGenConfig();
-        g.checkpoint_interval = kCkptInterval;
         auto source = std::make_unique<DeterministicGenerator>(g);
         auto sink = std::make_unique<MemorySink>();
         PartitionedPipelineConfig pc{};
@@ -280,14 +280,16 @@ static void BenchmarkCheckpointOverhead() {
         pipeline.Run();
     }
 
-    // Restore reps: generator with NO barriers (checkpoint_interval=0) so the
-    // timed reps write no new checkpoints; restore still loads the highest
-    // complete checkpoint already on disk. stats.restore_state_micros isolates
-    // the snapshot load from the generator's O(offset) Seek replay.
+    // Restore reps: the SAME generator configuration, since the checkpoint job
+    // manifest rejects a changed barrier cadence. The populate run already
+    // checkpointed at the final offset (num_records is a multiple of the
+    // interval), so each rep restores there, replays nothing, and writes no new
+    // checkpoint. stats.restore_state_micros isolates the snapshot load from the
+    // generator's O(offset) Seek replay.
     std::vector<double> state_us, seek_us;
     uint64_t restored_from = 0;
     for (int i = 0; i < kReps; ++i) {
-        auto source = std::make_unique<DeterministicGenerator>(ScalingGenConfig());
+        auto source = std::make_unique<DeterministicGenerator>(g);
         auto sink = std::make_unique<MemorySink>();
         PartitionedPipelineConfig pc{};
         pc.num_workers = kN;
