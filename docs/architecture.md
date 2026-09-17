@@ -124,9 +124,23 @@ is captured and rethrown to the caller. Cancellation closes every worker queue,
 wakes blocked producers and consumers, and joins all started threads. This also
 covers a worker failure while the router is blocked by backpressure.
 
-A custom `Source::Next()` that blocks forever cannot currently be interrupted;
-the source interface has no cancellation hook. The separate TCP path uses
-nonblocking sockets and bounded poll calls rather than this pull interface.
+`RequestStop(mode)` is the orderly stop, callable from any thread. It sets a stop
+signal the router checks between source batches and calls `Source::Cancel()`,
+which a blocking source implements to make a pending `Next()` return. A suspend
+stop broadcasts one more checkpoint barrier at the source's current offset
+(when checkpointing), then a suspend sentinel: workers flush output and exit
+without firing open windows. A final stop sends the usual end-of-stream
+sentinel. A source that blocks in `Next()` and does not implement `Cancel()`
+still cannot be interrupted.
+
+An empty batch from `Source::Next()` means "no data yet". The router backs off,
+yielding and then sleeping up to 1 ms, and polls again.
+
+`Progress()` returns counters that workers publish into atomics after every
+batch: records read and processed, windows fired, late records, checkpoints,
+the newest complete checkpoint, and the minimum partition watermark. The
+separate TCP path uses nonblocking sockets and bounded poll calls rather than
+this pull interface.
 
 ## Repository map
 
@@ -140,6 +154,6 @@ src/sink         memory, stdout, and durable crash-harness sinks
 src/oracle       independent aggregation oracle and differential runners
 src/nemesis      fork/SIGKILL recovery scenarios
 app              demo, benchmark, oracle, and nemesis executables
-test             175 GoogleTest cases; app also registers two TCP process scenarios
+test             GoogleTest suite; app also registers two TCP process scenarios
 bench/flink      matched Apache Flink DataStream comparator
 ```

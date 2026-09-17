@@ -98,6 +98,7 @@ void KeyedProcessor::ProcessControl(const ControlRecord& c) {
             CheckpointWriter writer(checkpoint_dir_, true);
             if (writer.WriteCheckpoint(c.checkpoint_offset, watermark_.Current(), state_)) {
                 stats_.checkpoints_written++;
+                if (checkpoint_listener_) checkpoint_listener_(c.checkpoint_offset);
             } else {
                 throw std::runtime_error("partition checkpoint write failed");
             }

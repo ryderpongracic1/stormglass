@@ -66,9 +66,15 @@ A source without an initial watermark holds progress back. The merge emits only
 strict advances, so it never regresses even when an idle source resumes with a
 stale frontier.
 
-Idleness is based on consecutive empty logical pulls, not wall-clock time. This
-makes the merged trajectory deterministic and replayable. The policy models the
-semantics of idle exclusion; it is not a production broker-idleness detector.
+Replayable merges base idleness on consecutive empty logical pulls, not
+wall-clock time, which keeps the merged trajectory deterministic and replayable.
+That policy models idle exclusion over configured idle spans.
+
+Live merges (`live_inputs`) accept channels that return empty batches while
+they have no data and can set `idle_timeout_wall`: a channel that produces
+nothing for that long is excluded exactly as above and rejoins when it produces
+again. Their merge order depends on arrival timing, so they are not replayable
+and cannot be checkpointed.
 
 A channel excluded from the watermark minimum is also excluded from barrier
 alignment. Otherwise an active source could wait forever for a quiet peer.
@@ -78,5 +84,9 @@ When all channels are idle, the last emitted watermark remains unchanged.
 
 End-of-stream causes each processor to emit active panes and pending re-fires.
 This makes finite deterministic workloads comparable as complete result sets.
+`RequestStop(StopMode::kFinal)` has the same effect on a running job.
+`RequestStop(StopMode::kSuspend)` does not: open windows stay unfired (and are
+checkpointed when checkpointing is enabled), so a later restart emits them once
+with their complete values.
 It does not replace watermark-driven lifecycle management for an unbounded
 stream.
