@@ -1,17 +1,21 @@
 add_executable(stormglass_demo stormglass/main.cpp)
 target_link_libraries(stormglass_demo PRIVATE stormglass_lib)
 
-add_executable(stormglass_bench bench/main.cpp)
-target_link_libraries(stormglass_bench PRIVATE stormglass_lib)
-target_compile_options(stormglass_bench PRIVATE -O3 -march=native)
+# Benchmarks compile with -march=native, so they are opt-in: a default build
+# stays portable to other machines of the same architecture.
+if(STORMGLASS_BENCH)
+    add_executable(stormglass_bench bench/main.cpp)
+    target_link_libraries(stormglass_bench PRIVATE stormglass_lib)
+    target_compile_options(stormglass_bench PRIVATE -O3 -march=native)
 
-add_executable(stormglass_scanbench bench/scan_main.cpp)
-target_link_libraries(stormglass_scanbench PRIVATE stormglass_lib)
-target_compile_options(stormglass_scanbench PRIVATE -O3 -march=native)
+    add_executable(stormglass_scanbench bench/scan_main.cpp)
+    target_link_libraries(stormglass_scanbench PRIVATE stormglass_lib)
+    target_compile_options(stormglass_scanbench PRIVATE -O3 -march=native)
 
-add_executable(stormglass_compare bench/compare_main.cpp)
-target_link_libraries(stormglass_compare PRIVATE stormglass_lib)
-target_compile_options(stormglass_compare PRIVATE -O3 -march=native)
+    add_executable(stormglass_compare bench/compare_main.cpp)
+    target_link_libraries(stormglass_compare PRIVATE stormglass_lib)
+    target_compile_options(stormglass_compare PRIVATE -O3 -march=native)
+endif()
 
 add_executable(stormglass_oracle oracle/main.cpp)
 target_link_libraries(stormglass_oracle PRIVATE stormglass_lib)

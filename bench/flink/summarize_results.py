@@ -59,7 +59,7 @@ def read_result(path: pathlib.Path, engine: str, parallelism: int) -> dict[str, 
     return result
 
 
-def summarize(directory: pathlib.Path) -> str:
+def summarize(directory: pathlib.Path, correctness_only: bool = False) -> str:
     files: dict[tuple[str, int, int], pathlib.Path] = {}
     for path in directory.glob('*-n*-run*.txt'):
         match = re.fullmatch(r'(stormglass|flink)-n([1-9]\d*)-run([1-9]\d*)\.txt', path.name)
@@ -98,14 +98,19 @@ def summarize(directory: pathlib.Path) -> str:
         # Derive rates from count and duration instead of trusting a reported ratio.
         rates.setdefault(n, {'stormglass': [], 'flink': []})[engine].append(
             int(result['records']) / float(result['seconds']) / 1e6)
-    lines = ['N  engine       median M rec/s   range M rec/s       stormglass/flink']
-    for n, engines in sorted(rates.items()):
-        ratio = statistics.median(engines['stormglass']) / statistics.median(engines['flink'])
-        for engine in ('stormglass', 'flink'):
-            values = engines[engine]
-            suffix = f'{ratio:6.2f}x' if engine == 'stormglass' else ''
-            lines.append(f'{n:<2} {engine:<12} {statistics.median(values):>8.3f}          '
-                         f'{min(values):>6.3f}-{max(values):<6.3f}  {suffix}')
+    lines = []
+    if correctness_only:
+        lines.append('Throughput omitted: correctness-only check (small fixtures are dominated '
+                     'by startup, so their rates and ratios are not performance evidence).')
+    else:
+        lines.append('N  engine       median M rec/s   range M rec/s       stormglass/flink')
+        for n, engines in sorted(rates.items()):
+            ratio = statistics.median(engines['stormglass']) / statistics.median(engines['flink'])
+            for engine in ('stormglass', 'flink'):
+                values = engines[engine]
+                suffix = f'{ratio:6.2f}x' if engine == 'stormglass' else ''
+                lines.append(f'{n:<2} {engine:<12} {statistics.median(values):>8.3f}          '
+                             f'{min(values):>6.3f}-{max(values):<6.3f}  {suffix}')
     lines.append(f'Validated {len(files)} jobs: complete matrix; actual/expected records, '
                  'workload, output counts, late drops, and dual digests match across all jobs.')
     lines.append('Digest agreement is a probabilistic multiset check, not proof of identical output.')
@@ -117,9 +122,11 @@ def summarize(directory: pathlib.Path) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('result_dir', type=pathlib.Path)
+    parser.add_argument('--correctness-only', action='store_true',
+                        help='validate the jobs but omit throughput and ratios')
     args = parser.parse_args()
     try:
-        print(summarize(args.result_dir))
+        print(summarize(args.result_dir, correctness_only=args.correctness_only))
     except (ValueError, KeyError, OSError) as error:
         parser.exit(1, f'comparison rejected: {error}\n')
 

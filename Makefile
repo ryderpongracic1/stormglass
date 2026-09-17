@@ -13,7 +13,7 @@ test: build
 	cd $(BUILD_DIR) && ctest --output-on-failure
 
 release:
-	cmake -B $(RELEASE_DIR) -DCMAKE_BUILD_TYPE=Release
+	cmake -B $(RELEASE_DIR) -DCMAKE_BUILD_TYPE=Release -DSTORMGLASS_BENCH=ON
 	cmake --build $(RELEASE_DIR) -j$$(getconf _NPROCESSORS_ONLN)
 
 bench: release
