@@ -205,10 +205,15 @@ public:
     std::optional<Batch> Next() override;
     void Seek(uint64_t offset) override;
     [[nodiscard]] uint64_t CurrentOffset() const override;
-    /// Channel descriptors, their idle spans, and the idle timeout. Empty if any
-    /// channel is itself undescribed, since the merge can then not be validated.
+    /// Channel descriptors, lengths and idle spans, and the idle timeout. Empty
+    /// if any channel is itself undescribed, since the merge can then not be
+    /// validated.
     [[nodiscard]] std::string Descriptor() const override;
-    /// False for live_inputs or when any channel is not replayable.
+    /// Sum of the channel lengths; nullopt if any channel's is unknown.
+    [[nodiscard]] std::optional<uint64_t> Length() const override;
+    /// False for live_inputs, when any channel is not replayable, or when any
+    /// channel does not declare its Length(): an undeclared end could move on
+    /// restore and silently change the replayed merge order.
     [[nodiscard]] bool Replayable() const override;
     /// Forwards to every channel.
     void Cancel() override;

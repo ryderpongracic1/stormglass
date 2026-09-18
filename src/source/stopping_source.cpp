@@ -12,6 +12,7 @@ std::optional<Batch> StoppingSource::Next() {
 
     auto batch = inner_->Next();
     if (!batch.has_value()) return std::nullopt;
+    if (batch->empty()) return Batch{};  // "no data yet", not end of stream
 
     // Count only records (not control records) toward the limit
     Batch result;

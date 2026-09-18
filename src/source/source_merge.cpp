@@ -83,7 +83,13 @@ std::string SourceMerge::Descriptor() const {
     for (const SourceState& st : states_) {
         const std::string channel = st.source->Descriptor();
         if (channel.empty()) return "";
-        out += ";" + channel;
+        // Channel ends change the interleaving after them, so they are part of
+        // the merged stream's identity even though a lone source omits them.
+        const auto length = st.source->Length();
+        out += ";" + channel + "#length=" +
+               (!length ? std::string("unknown")
+                        : *length == kUnbounded ? std::string("unbounded")
+                                                : std::to_string(*length));
         for (const auto& span : st.idle_spans) {
             out += "@idle(" + std::to_string(span.start_offset) + "," +
                    std::to_string(span.length) + ")";
@@ -328,10 +334,22 @@ std::optional<Batch> SourceMerge::Next() {
     return out;
 }
 
+std::optional<uint64_t> SourceMerge::Length() const {
+    uint64_t total = 0;
+    for (const SourceState& st : states_) {
+        const auto length = st.source->Length();
+        if (!length) return std::nullopt;
+        if (*length == kUnbounded || total > kUnbounded - *length) return kUnbounded;
+        total += *length;
+    }
+    return total;
+}
+
 bool SourceMerge::Replayable() const {
     if (config_.live_inputs) return false;
-    return std::all_of(states_.begin(), states_.end(),
-                       [](const SourceState& s) { return s.source->Replayable(); });
+    return std::all_of(states_.begin(), states_.end(), [](const SourceState& s) {
+        return s.source->Replayable() && s.source->Length().has_value();
+    });
 }
 
 void SourceMerge::Cancel() {

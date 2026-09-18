@@ -121,8 +121,9 @@ checked before state mutation.
 
 The first exception from a source, worker, sink, allocation, or checkpoint path
 is captured and rethrown to the caller. Cancellation closes every worker queue,
-wakes blocked producers and consumers, and joins all started threads. This also
-covers a worker failure while the router is blocked by backpressure.
+wakes blocked producers and consumers, calls `Source::Cancel()` so a router
+blocked in `Next()` returns, and joins all started threads. This covers a worker
+failure while the router is blocked by backpressure or waiting for input.
 
 `RequestStop(mode)` is the orderly stop, callable from any thread. It sets a stop
 signal the router checks between source batches and calls `Source::Cancel()`,

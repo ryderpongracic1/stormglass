@@ -81,6 +81,7 @@ public:
     // cadence. num_records and batch_size are excluded: a longer or re-batched
     // stream replays the same prefix.
     [[nodiscard]] std::string Descriptor() const override;
+    [[nodiscard]] std::optional<uint64_t> Length() const override { return config_.num_records; }
 
 private:
     Record GenerateRecord();

@@ -7,6 +7,7 @@
 #include "sink/durable_file_sink.h"
 #include "source/generator.h"
 #include "source/source_merge.h"
+#include "source/stopping_source.h"
 #include "window/sliding.h"
 #include "window/tumbling.h"
 
@@ -451,15 +452,15 @@ TEST_F(RecoveryGapsTest, MergedArbitrarySourcesRecoverThroughPartitionedPipeline
                               {.num_workers = 3});
         p.Run();
     }
-    // Same merged job restored mid-stream from a checkpoint written by a
-    // truncated run: descriptors match, so the manifest accepts it.
-    auto a_short = a;
-    auto b_short = b;
-    a_short.num_records = 1200;
-    b_short.num_records = 1200;
+    // Same merged job restored mid-stream from a checkpoint written by a run
+    // cut short by StoppingSource. The inputs are unchanged (changing an input's
+    // length would change the merge order and is rejected), so the manifest
+    // accepts it.
     std::vector<WindowResult> recovered;
     {
-        PartitionedPipeline p(std::make_unique<SourceMerge>(Inputs({a_short, b_short}), SourceMergeConfig{}),
+        PartitionedPipeline p(std::make_unique<StoppingSource>(
+                                  std::make_unique<SourceMerge>(Inputs({a, b}), SourceMergeConfig{}),
+                                  2400),
                               Tumbling(250), std::make_unique<CaptureSink>(recovered),
                               {.num_workers = 3, .checkpoint_dir = dir});
         p.Run();

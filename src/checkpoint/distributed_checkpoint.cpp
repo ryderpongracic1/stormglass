@@ -21,9 +21,8 @@ std::string PartitionCheckpointDir(const std::string& root, uint32_t partition) 
     return root + buf;
 }
 
-std::optional<uint64_t> HighestCompleteCheckpoint(const std::string& root,
-                                                  uint32_t num_partitions) {
-    if (num_partitions == 0) return std::nullopt;
+std::vector<uint64_t> CompleteCheckpoints(const std::string& root, uint32_t num_partitions) {
+    if (num_partitions == 0) return {};
 
     // Seed the intersection with partition 0's valid offsets, then keep only
     // offsets that also appear in every other partition. The surviving set is
@@ -40,9 +39,14 @@ std::optional<uint64_t> HighestCompleteCheckpoint(const std::string& root,
         }
         common.swap(next);
     }
+    return {common.begin(), common.end()};  // std::set iterates in ascending order
+}
 
-    if (common.empty()) return std::nullopt;
-    return *common.rbegin();  // std::set is ordered — the max is the last element
+std::optional<uint64_t> HighestCompleteCheckpoint(const std::string& root,
+                                                  uint32_t num_partitions) {
+    auto complete = CompleteCheckpoints(root, num_partitions);
+    if (complete.empty()) return std::nullopt;
+    return complete.back();
 }
 
 std::optional<uint64_t> HighestPartialCheckpoint(const std::string& root,
@@ -59,12 +63,15 @@ std::optional<uint64_t> HighestPartialCheckpoint(const std::string& root,
 PartitionedCheckpointTracker::PartitionedCheckpointTracker(std::string root,
                                                            uint32_t num_partitions,
                                                            uint32_t retain,
-                                                           std::optional<uint64_t> restored)
+                                                           std::vector<uint64_t> existing_complete)
     : root_(std::move(root)),
       num_partitions_(num_partitions),
       retain_(retain),
       latest_(num_partitions) {
-    if (restored) complete_.push_back(*restored);
+    const std::size_t keep = std::max<uint32_t>(retain_, 1);
+    const std::size_t first = existing_complete.size() > keep ? existing_complete.size() - keep : 0;
+    complete_.assign(existing_complete.begin() + static_cast<std::ptrdiff_t>(first),
+                     existing_complete.end());
 }
 
 void PartitionedCheckpointTracker::OnPartitionCheckpoint(uint32_t partition, uint64_t offset) {

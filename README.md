@@ -88,7 +88,7 @@ restore algorithm, and source/sink contract are in
 
 ## Correctness evidence
 
-The current CTest suite contains **203 tests** (201 GoogleTest cases and two
+The current CTest suite contains **210 tests** (208 GoogleTest cases and two
 TCP process scenarios) and runs under ASan/UBSan plus
 ThreadSanitizer on Linux and macOS in CI.
 
@@ -195,7 +195,8 @@ measurement. Its current boundaries are explicit:
   file, socket or broker connectors. `SourceMerge` combines K `Source` inputs
   through round-robin pulls on one thread. Replayable merges restore by
   replaying every input from its start, because no per-input offset vector is
-  persisted. Live merges (quiet inputs, wall-clock idleness) cannot be
+  persisted; each input must therefore declare its length, and changing any
+  input's length rejects the restore. Live merges (quiet inputs, wall-clock idleness) cannot be
   checkpointed.
 - The data model is fixed: string keys, `int64` values, and a sum plus count per
   key and window. There are no other aggregate functions, value types, or

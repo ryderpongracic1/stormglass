@@ -247,9 +247,12 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
     // remaining records to the same workers.
     Stats stats{};
     std::optional<uint64_t> restored;
+    std::vector<uint64_t> complete_history;  // ascending; restore uses the newest
     if (checkpointing) {
         const auto scan_t0 = std::chrono::steady_clock::now();
-        if (auto complete = HighestCompleteCheckpoint(config_.checkpoint_dir, n)) {
+        complete_history = CompleteCheckpoints(config_.checkpoint_dir, n);
+        if (!complete_history.empty()) {
+            const std::optional<uint64_t> complete = complete_history.back();
             for (uint32_t i = 0; i < n; ++i) {
                 CheckpointReader reader(workers[i]->ckpt_dir);
                 if (auto data = reader.LoadOffset(*complete)) {
@@ -286,7 +289,8 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
     // Completion tracking and coordinated retention across partitions.
     std::optional<PartitionedCheckpointTracker> tracker;
     if (checkpointing) {
-        tracker.emplace(config_.checkpoint_dir, n, config_.checkpoint_retention, restored);
+        tracker.emplace(config_.checkpoint_dir, n, config_.checkpoint_retention,
+                        std::move(complete_history));
         if (restored) {
             control_->last_complete_checkpoint.store(*restored);
             control_->has_complete_checkpoint.store(true);
@@ -312,6 +316,9 @@ PartitionedPipeline::Stats PartitionedPipeline::Run() {
         }
         cancelled.store(true);
         for (auto& w : workers) w->queue.Close();
+        // The router may be blocked in Next() waiting for input; wake it so
+        // Run() can join and report this failure.
+        source_->Cancel();
     };
     // Joining is also required when creating a thread itself fails.
     struct JoinWorkers {

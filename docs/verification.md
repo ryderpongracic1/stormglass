@@ -1,7 +1,7 @@
 # Verification
 
 stormglass uses deterministic generation, an independent aggregation oracle,
-direct protocol tests, fault injection, and sanitizers. The CTest suite contains 203 tests: 201
+direct protocol tests, fault injection, and sanitizers. The CTest suite contains 210 tests: 208
 GoogleTest cases and two separate-process TCP scenarios. Benchmark tooling has separate Python and executable regression checks; these are not included in that count.
 
 ## Differential oracle
@@ -105,6 +105,17 @@ The findings that motivated these tests are recorded in
   5,000 polls);
 - coordinated retention keeping exactly the newest complete checkpoints, and
   the tracker never deleting a retained cut or a newer partial set.
+
+`review_regressions_test.cpp` pins four defects found in review:
+
+- restoring a merge after one input was extended is rejected by the manifest
+  (the unchanged-input restore is the positive control), and a merge with a
+  channel of undeclared length refuses checkpointing;
+- a sink failure while the router is blocked in `Next()` ends `Run()` with the
+  exception instead of hanging;
+- retention after a restart keeps the complete checkpoints already on disk;
+- `StoppingSource` passes an empty "no data yet" batch through instead of
+  ending the stream.
 
 ## Sanitizers and CI
 

@@ -394,6 +394,7 @@ struct AlwaysQuiet : Source {
     std::optional<Batch> Next() override { ++polls; return Batch{}; }
     void Seek(uint64_t) override {}
     uint64_t CurrentOffset() const override { return 0; }
+    std::optional<uint64_t> Length() const override { return kUnbounded; }
 };
 
 GeneratorConfig LiveGen() {
@@ -615,7 +616,7 @@ TEST_F(LifecycleTest, TrackerNeverPrunesIncompleteOrRetainedCheckpoints) {
     for (uint32_t k = 0; k < n; ++k) { write(k, 100); write(k, 200); }
     write(0, 300);
 
-    PartitionedCheckpointTracker tracker(dir, n, /*retain=*/1, /*restored=*/200);
+    PartitionedCheckpointTracker tracker(dir, n, /*retain=*/1, CompleteCheckpoints(dir, n));
     EXPECT_EQ(tracker.LastComplete(), 200u);
 
     write(0, 300);

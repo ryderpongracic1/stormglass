@@ -38,6 +38,9 @@ std::string PartitionCheckpointDir(const std::string& root, uint32_t partition);
 std::optional<uint64_t> HighestCompleteCheckpoint(const std::string& root,
                                                   uint32_t num_partitions);
 
+// Every offset complete across all `num_partitions` partitions, ascending.
+std::vector<uint64_t> CompleteCheckpoints(const std::string& root, uint32_t num_partitions);
+
 // The highest offset present (CRC-valid) in ANY single partition, regardless of
 // whether the other partitions have it. When this exceeds
 // HighestCompleteCheckpoint (or the latter is nullopt while this is set), a torn
@@ -62,10 +65,12 @@ std::optional<uint64_t> HighestPartialCheckpoint(const std::string& root,
 // costs space. Thread-safe.
 class PartitionedCheckpointTracker {
 public:
-    // `restored` is the complete checkpoint the job restored from, if any; it
-    // counts as the first retained complete checkpoint. retain == 0 keeps all.
+    // `existing_complete` lists the complete checkpoints already on disk,
+    // ascending (CompleteCheckpoints); the newest `retain` of them count toward
+    // retention, so a restart does not forget history it should keep.
+    // retain == 0 keeps all.
     PartitionedCheckpointTracker(std::string root, uint32_t num_partitions, uint32_t retain,
-                                 std::optional<uint64_t> restored);
+                                 std::vector<uint64_t> existing_complete);
 
     void OnPartitionCheckpoint(uint32_t partition, uint64_t offset);
 

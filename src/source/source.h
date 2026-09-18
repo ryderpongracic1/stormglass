@@ -1,5 +1,6 @@
 #pragma once
 #include "stream/batch.h"
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -25,6 +26,15 @@ public:
     // only extends or regroups it (stream length, batch size). Empty means the
     // source is not validated on restore.
     [[nodiscard]] virtual std::string Descriptor() const { return ""; }
+
+    // Data records the source yields before ending: a count, kUnbounded if it
+    // never ends, or std::nullopt if that is not known in advance. A single
+    // source may omit it, since extending a stream leaves its replayed prefix
+    // intact. Inside SourceMerge it matters: where a channel ends changes the
+    // merged order after that point, so a replayable merge requires every
+    // channel to declare it and records it in the merge descriptor.
+    static constexpr uint64_t kUnbounded = UINT64_MAX;
+    [[nodiscard]] virtual std::optional<uint64_t> Length() const { return std::nullopt; }
 
     // Whether Seek(O) followed by Next() reproduces the trajectory an
     // uninterrupted run produced after O. Checkpointed jobs refuse to start on a

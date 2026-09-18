@@ -70,6 +70,16 @@ Checkpointed jobs refuse a source whose `Replayable()` is false. A live
 `SourceMerge` reports false, because its interleaving depends on arrival timing;
 a durable live merge would need per-input offsets in the checkpoint.
 
+A replayable merge also depends on where each input ends: once an input is
+exhausted, round-robin skips it, so extending or shortening one input changes
+the merged order after its former end. Replaying such a changed stream to the
+checkpoint offset would apply a different mix of records than the checkpoint
+holds. Every channel of a checkpointed merge must therefore declare
+`Source::Length()` (a record count, or `Source::kUnbounded`). A merge with an
+undeclared channel reports `Replayable()` false, and the declared lengths are
+part of the merge descriptor, so the job manifest rejects a restore after any
+input's length changes.
+
 The deterministic generator implements seek by replaying from its seed, which
 is O(offset). `SourceMerge` accepts arbitrary replayable `Source` channels, but
 its seek rewinds each channel to 0 and replays the merge, so it is O(offset)
@@ -89,9 +99,10 @@ manifest is also rejected, because it cannot be verified.
 
 Built-in descriptors cover tumbling and sliding geometry, generator seed, key
 space, event-time step, disorder shape, and watermark and barrier cadence.
-`SourceMerge` combines its channel descriptors with idle spans and idle timeout.
-`StoppingSource` reports its inner source. Stream length and batch size are
-excluded because they do not change the replayed prefix. Custom assigners and
+`SourceMerge` combines its channel descriptors and lengths with idle spans and
+the idle timeout. `StoppingSource` reports its inner source. A single source's
+length and batch size are excluded because they do not change its replayed
+prefix; inside a merge, channel lengths do, so the merge includes them. Custom assigners and
 sources describe themselves as empty strings by default, which only match
 another empty string; override `Descriptor()` to have them validated.
 
@@ -147,7 +158,9 @@ coordinated pruning. Workers report each durable checkpoint to one tracker.
 Every partition receives the same barriers in order, so the minimum of the
 partitions' latest offsets is the newest complete checkpoint, with no directory
 scan. The tracker keeps the newest `checkpoint_retention` complete checkpoints
-and deletes partition files below the oldest one it keeps. Newer partial sets
+and deletes partition files below the oldest one it keeps. On restart it starts
+from the complete checkpoints already on disk (found by the same scan restore
+uses), so the retained history carries across restarts. Newer partial sets
 are never touched. The default of 0 retains all history, so disk use and
 recovery scans grow over time. The single-threaded `Pipeline` keeps its latest
 two checkpoints.
